@@ -14,10 +14,30 @@ pub(super) struct AgentRow {
     pub(super) pane_id: String,
     pub(super) status: crate::api::schema::AgentStatus,
     pub(super) focused: bool,
+    pub(super) pinned: bool,
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
 
+const PIN_MARKER: &str = "📌";
+
+/// The agents panel order: pinned panes first, in the order they were pinned, then the rest in
+/// the active view's or built-in sort's order.
 pub(super) fn ordered_agent_pane_ids(
+    snapshot: &ClientShellSnapshot,
+    sort: crate::config::AgentPanelSortConfig,
+    pinned: &[String],
+) -> Vec<String> {
+    let mut order = sorted_agent_pane_ids(snapshot, sort);
+    order.sort_by_key(|pane_id| {
+        pinned
+            .iter()
+            .position(|pinned| pinned == pane_id)
+            .unwrap_or(usize::MAX)
+    });
+    order
+}
+
+fn sorted_agent_pane_ids(
     snapshot: &ClientShellSnapshot,
     sort: crate::config::AgentPanelSortConfig,
 ) -> Vec<String> {
@@ -239,7 +259,7 @@ pub(super) fn agent_rows(
     config: &ClientShellConfig,
     machine: Option<&str>,
 ) -> Vec<AgentRow> {
-    ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
+    ordered_agent_pane_ids(snapshot, config.agent_panel_sort, &config.pinned_agents)
         .into_iter()
         .filter_map(|pane_id| agent_row(snapshot, &pane_id, config, machine))
         .collect()
@@ -272,9 +292,10 @@ pub(super) fn agent_row(
     let tab_label = tab
         .filter(|tab| tab_count > 1 || tab.custom_label)
         .map(|tab| tab.label.as_str());
-    let agent_label = agent
-        .display_agent
-        .as_deref()
+    // A name the user gave the pane outranks names reported by integrations and plugins.
+    let agent_label = pane
+        .and_then(|pane| pane.label.as_deref())
+        .or(agent.display_agent.as_deref())
         .or(agent.name.as_deref())
         .or(agent.agent.as_deref())
         .or(agent.title.as_deref());
@@ -314,6 +335,8 @@ pub(super) fn agent_row(
         pane_id: agent.pane_id.clone(),
         status: agent.agent_status,
         focused: agent.focused,
+        // Pins are kept per local endpoint; aggregated machine rows (machine set) are never pinned.
+        pinned: machine.is_none() && config.pinned_agents.contains(&agent.pane_id),
         rows,
     })
 }
@@ -353,8 +376,10 @@ pub(super) fn render_agent_row(
     } else {
         row.rows.clone()
     };
+    let pin_width = display_width(PIN_MARKER) as u16 + 1;
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
         let indent = if index == 0 { 1 } else { 3 };
+        let pin = row.pinned && index == 0 && rect.width > indent as u16 + pin_width;
         let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
         spans.extend(crate::ui::resolved_token_spans(
             tokens,
@@ -364,12 +389,23 @@ pub(super) fn render_agent_row(
             secondary,
             secondary,
             palette,
-            rect.width.saturating_sub(indent as u16) as usize,
+            rect.width
+                .saturating_sub(indent as u16)
+                .saturating_sub(if pin { pin_width } else { 0 }) as usize,
         ));
-        Paragraph::new(Line::from(spans)).style(row_style).render(
-            Rect::new(rect.x, rect.y + index as u16, rect.width, 1),
-            buffer,
-        );
+        let line = Rect::new(rect.x, rect.y + index as u16, rect.width, 1);
+        Paragraph::new(Line::from(spans))
+            .style(row_style)
+            .render(line, buffer);
+        if pin {
+            buffer.set_stringn(
+                line.right().saturating_sub(pin_width),
+                line.y,
+                PIN_MARKER,
+                display_width(PIN_MARKER),
+                row_style,
+            );
+        }
     }
 }
 

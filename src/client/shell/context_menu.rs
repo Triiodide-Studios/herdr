@@ -75,6 +75,21 @@ impl ClientContextMenuOverlay {
                 ]);
                 items
             }
+            ClientContextMenuTarget::Agent {
+                has_manual_label,
+                pinned,
+                ..
+            } => {
+                let mut items = vec![
+                    item(if *pinned { "Unpin" } else { "Pin" }, Action::TogglePin),
+                    item("Rename", Action::RenamePane),
+                ];
+                if *has_manual_label {
+                    items.push(item("Clear name", Action::ClearPaneName));
+                }
+                items.push(item("Close", Action::ClosePane));
+                items
+            }
         }
     }
 }
@@ -167,6 +182,42 @@ impl ClientShellState {
         }));
     }
 
+    pub(super) fn open_agent_context_menu(&mut self, pane_id: String, x: u16, y: u16) {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return;
+        };
+        if !snapshot.agents.iter().any(|agent| agent.pane_id == pane_id) {
+            return;
+        }
+        let has_manual_label = snapshot
+            .panes
+            .iter()
+            .any(|pane| pane.pane_id == pane_id && pane.label.is_some());
+        let pinned = self.config.pinned_agents.contains(&pane_id);
+        self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+            target: ClientContextMenuTarget::Agent {
+                pane_id,
+                has_manual_label,
+                pinned,
+            },
+            x,
+            y,
+            highlighted: 0,
+        }));
+    }
+
+    /// Pins an agent pane to the top of the agents panel, or unpins it, and saves the pins with
+    /// the rest of this endpoint's chrome preferences.
+    pub(super) fn toggle_agent_pin(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
+        let pinned = &mut self.config.pinned_agents;
+        if let Some(index) = pinned.iter().position(|pinned| *pinned == pane_id) {
+            pinned.remove(index);
+        } else {
+            pinned.push(pane_id);
+        }
+        self.persist_chrome_preferences(outcome);
+    }
+
     pub(super) fn move_context_menu_selection(&mut self, delta: isize) {
         let Some(ClientShellOverlay::ContextMenu(menu)) = self.overlay.as_mut() else {
             return;
@@ -213,8 +264,71 @@ impl ClientShellState {
                 action,
                 outcome,
             ),
+            ClientContextMenuTarget::Agent { pane_id, .. } => {
+                self.activate_agent_context_action(pane_id, action, outcome)
+            }
         }
         outcome.repaint = true;
+    }
+
+    fn activate_agent_context_action(
+        &mut self,
+        pane_id: String,
+        action: ClientContextMenuAction,
+        outcome: &mut ClientShellInput,
+    ) {
+        match action {
+            ClientContextMenuAction::TogglePin => self.toggle_agent_pin(pane_id, outcome),
+            ClientContextMenuAction::ClosePane => {
+                self.config
+                    .pinned_agents
+                    .retain(|pinned| *pinned != pane_id);
+                self.persist_chrome_preferences(outcome);
+                self.push_endpoint_method(
+                    crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+                        pane_id,
+                    }),
+                    outcome,
+                );
+            }
+            ClientContextMenuAction::RenamePane => self.open_pane_rename_overlay(pane_id, true),
+            ClientContextMenuAction::ClearPaneName => self.push_endpoint_method(
+                crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                    pane_id,
+                    label: None,
+                }),
+                outcome,
+            ),
+            _ => {}
+        }
+    }
+
+    /// Opens the pane rename prompt on the pane's manual name. With `start_from_agent_name`, a pane
+    /// without one starts from the agent name the sidebar shows, selected for replacement.
+    fn open_pane_rename_overlay(&mut self, pane_id: String, start_from_agent_name: bool) {
+        let snapshot = self.snapshot.as_deref();
+        let label = snapshot.and_then(|snapshot| {
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .and_then(|pane| pane.label.clone())
+        });
+        let agent_name = snapshot
+            .filter(|_| start_from_agent_name)
+            .and_then(|snapshot| {
+                snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.pane_id == pane_id)
+            })
+            .and_then(|agent| agent.display_agent.clone().or_else(|| agent.name.clone()));
+        let initial = label.clone().or(agent_name).unwrap_or_default();
+        self.overlay = Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+            title: "rename pane",
+            input: TextEditor::new(&initial, label.is_none()),
+            target: ClientRenameTarget::Pane { pane_id },
+        }));
     }
 
     fn activate_workspace_context_action(
@@ -379,20 +493,7 @@ impl ClientShellState {
         };
 
         match action {
-            ClientContextMenuAction::RenamePane => {
-                let label = self.snapshot.as_deref().and_then(|snapshot| {
-                    snapshot
-                        .panes
-                        .iter()
-                        .find(|pane| pane.pane_id == pane_id)
-                        .and_then(|pane| pane.label.clone())
-                });
-                self.overlay = Some(ClientShellOverlay::Rename(ClientRenameOverlay {
-                    title: "rename pane",
-                    input: TextEditor::new(label.as_deref().unwrap_or_default(), label.is_none()),
-                    target: ClientRenameTarget::Pane { pane_id },
-                }));
-            }
+            ClientContextMenuAction::RenamePane => self.open_pane_rename_overlay(pane_id, false),
             ClientContextMenuAction::ClearPaneName => self.push_endpoint_method(
                 Method::PaneRename(PaneRenameParams {
                     pane_id,
