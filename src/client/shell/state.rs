@@ -256,6 +256,10 @@ pub(crate) enum ClientShellAction {
     },
     ReplayMouse(Vec<crossterm::event::MouseEvent>),
     Keybind(crate::input::KeybindAction),
+    /// Open a focused tab in the local endpoint's workspace and run a new agent chat in it.
+    StartChatTab {
+        workspace_id: String,
+    },
 }
 
 #[derive(Default)]
@@ -528,6 +532,7 @@ pub(super) enum ClientContextMenuAction {
     ToggleRightClickPassthrough,
     ClosePane,
     TogglePin,
+    NewChat,
 }
 
 #[derive(Debug)]
@@ -554,6 +559,9 @@ pub(super) enum ClientContextMenuTarget {
         pane_id: String,
         has_manual_label: bool,
         pinned: bool,
+    },
+    AgentPanel {
+        workspace_id: String,
     },
 }
 

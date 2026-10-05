@@ -1824,6 +1824,11 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                if super::contains(self.hits.agent_body, point) {
+                    self.open_agent_panel_context_menu(mouse.column, mouse.row);
+                    outcome.repaint = true;
+                    return;
+                }
                 let tab_id = self
                     .hits
                     .tabs

@@ -90,6 +90,7 @@ impl ClientContextMenuOverlay {
                 items.push(item("Close", Action::ClosePane));
                 items
             }
+            ClientContextMenuTarget::AgentPanel { .. } => vec![item("New chat", Action::NewChat)],
         }
     }
 }
@@ -206,6 +207,27 @@ impl ClientShellState {
         }));
     }
 
+    /// The menu for open space in the agents panel. New chats start through the local server's
+    /// socket API, so the menu only opens while the local endpoint is active.
+    pub(super) fn open_agent_panel_context_menu(&mut self, x: u16, y: u16) {
+        if !self.active_endpoint_id.is_local() {
+            return;
+        }
+        let Some(workspace_id) = self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.focused_workspace_id.clone())
+        else {
+            return;
+        };
+        self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+            target: ClientContextMenuTarget::AgentPanel { workspace_id },
+            x,
+            y,
+            highlighted: 0,
+        }));
+    }
+
     /// Pins an agent pane to the top of the agents panel, or unpins it, and saves the pins with
     /// the rest of this endpoint's chrome preferences.
     pub(super) fn toggle_agent_pin(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
@@ -266,6 +288,13 @@ impl ClientShellState {
             ),
             ClientContextMenuTarget::Agent { pane_id, .. } => {
                 self.activate_agent_context_action(pane_id, action, outcome)
+            }
+            ClientContextMenuTarget::AgentPanel { workspace_id } => {
+                if action == ClientContextMenuAction::NewChat {
+                    outcome
+                        .actions
+                        .push(ClientShellAction::StartChatTab { workspace_id });
+                }
             }
         }
         outcome.repaint = true;

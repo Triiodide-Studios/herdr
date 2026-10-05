@@ -48,6 +48,9 @@ pub(super) fn dispatch_client_shell_actions(
                 }
             }
             shell::ClientShellAction::ReplayMouse(events) => replay_mouse.extend(events),
+            shell::ClientShellAction::StartChatTab { workspace_id } => {
+                start_chat_tab(workspace_id);
+            }
             shell::ClientShellAction::Keybind(action) => {
                 debug!(
                     ?action,
@@ -69,6 +72,52 @@ pub(super) fn dispatch_client_shell_actions(
         }
     }
     Ok((replay_mouse, repaint))
+}
+
+/// The command a new chat tab runs.
+const NEW_CHAT_COMMAND: &str = "claude";
+
+/// Opens a focused tab in `workspace_id` on the local server and runs a new chat in its pane. The
+/// client-shell protocol cannot run a command in a pane, so this uses the server's socket API, as
+/// `herdr tab create` and `herdr pane run` do, on a thread so the window keeps drawing.
+fn start_chat_tab(workspace_id: String) {
+    std::thread::spawn(move || {
+        if let Err(err) = start_chat_tab_blocking(workspace_id.clone()) {
+            warn!(err = %err, workspace_id = %workspace_id, "failed to start a chat tab");
+        }
+    });
+}
+
+fn start_chat_tab_blocking(workspace_id: String) -> Result<(), crate::api::client::ApiClientError> {
+    use crate::api::schema::{
+        Method, PaneSendInputParams, Request, ResponseResult, TabCreateParams,
+    };
+
+    let client = crate::api::client::ApiClient::local();
+    let created = client.request(Request {
+        id: "client:new-chat:tab".into(),
+        method: Method::TabCreate(TabCreateParams {
+            workspace_id: Some(workspace_id),
+            cwd: None,
+            focus: true,
+            label: None,
+            env: Default::default(),
+        }),
+    })?;
+    let ResponseResult::TabCreated { root_pane, .. } = created.result else {
+        return Err(crate::api::client::ApiClientError::UnexpectedResult(
+            "tab.create did not return the created tab".into(),
+        ));
+    };
+    client.request(Request {
+        id: "client:new-chat:run".into(),
+        method: Method::PaneSendInput(PaneSendInputParams {
+            pane_id: root_pane.pane_id,
+            text: NEW_CHAT_COMMAND.into(),
+            keys: vec!["Enter".into()],
+        }),
+    })?;
+    Ok(())
 }
 
 pub(super) fn client_shell_resize_message(

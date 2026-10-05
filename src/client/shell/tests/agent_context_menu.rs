@@ -175,3 +175,32 @@ fn closing_a_pinned_agent_closes_its_pane_and_drops_the_pin() {
         crate::api::schema::Method::PaneClose(target) if target.pane_id == "pane_2"
     ));
 }
+
+#[test]
+fn right_clicking_open_agent_panel_space_starts_a_chat_tab() {
+    let mut state = two_agent_state();
+    let body = state.hits.agent_body;
+    let last_row = state
+        .hits
+        .agents
+        .iter()
+        .map(|(rect, _)| rect.bottom())
+        .max()
+        .expect("agent rows");
+    assert!(
+        last_row < body.bottom(),
+        "the panel needs open space below the rows"
+    );
+    let open_space = Rect::new(body.x, last_row, body.width, 1);
+
+    let open = click(&mut state, MouseButton::Right, open_space);
+    assert!(open.actions.is_empty());
+    assert_eq!(menu_labels(&state), ["New chat"]);
+
+    let new_chat = choose(&mut state, "New chat");
+    assert!(state.overlay.is_none());
+    assert!(matches!(
+        &new_chat.actions[..],
+        [ClientShellAction::StartChatTab { workspace_id }] if workspace_id == "ws_1"
+    ));
+}
