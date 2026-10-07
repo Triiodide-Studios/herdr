@@ -51,6 +51,23 @@ pub(super) fn dispatch_client_shell_actions(
             shell::ClientShellAction::StartChatTab { workspace_id } => {
                 start_chat_tab(workspace_id);
             }
+            shell::ClientShellAction::CopyAgentSessionId { pane_id } => {
+                match agent_session_id(&pane_id) {
+                    Ok(session_id) => {
+                        crate::selection::write_osc52_bytes(session_id.as_bytes());
+                        if let Some(shell) = shell.as_deref_mut() {
+                            repaint |= shell.show_copy_feedback(std::time::Instant::now());
+                        }
+                    }
+                    Err(err) => {
+                        warn!(err = %err, pane_id = %pane_id, "failed to copy the chat id");
+                        if let Some(shell) = shell.as_deref_mut() {
+                            shell.set_endpoint_error(format!("copy chat ID: {err}"));
+                            repaint = true;
+                        }
+                    }
+                }
+            }
             shell::ClientShellAction::Keybind(action) => {
                 debug!(
                     ?action,
@@ -72,6 +89,29 @@ pub(super) fn dispatch_client_shell_actions(
         }
     }
     Ok((replay_mouse, repaint))
+}
+
+/// The agent session id of a pane on the local server (for Claude, the id `claude --resume` takes),
+/// asked of the server's socket API as `herdr agent get` does: the client-shell projection does not
+/// carry it. A local socket round trip, so the window does not visibly wait.
+fn agent_session_id(pane_id: &str) -> Result<String, String> {
+    use crate::api::schema::{AgentTarget, Method, Request, ResponseResult};
+
+    let reply = crate::api::client::ApiClient::local()
+        .request(Request {
+            id: "client:copy-chat-id".into(),
+            method: Method::AgentGet(AgentTarget {
+                target: pane_id.to_owned(),
+            }),
+        })
+        .map_err(|err| err.to_string())?;
+    let ResponseResult::AgentInfo { agent } = reply.result else {
+        return Err("agent.get did not return an agent".into());
+    };
+    agent
+        .agent_session
+        .map(|session| session.value)
+        .ok_or_else(|| "this chat has no session id yet".into())
 }
 
 /// The command a new chat tab runs.

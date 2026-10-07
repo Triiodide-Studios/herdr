@@ -98,7 +98,10 @@ fn right_clicking_an_agent_row_pins_it_to_the_top() {
 
     let open = right_click_agent(&mut state, "pane_2");
     assert!(open.actions.is_empty());
-    assert_eq!(menu_labels(&state), ["Pin", "Rename", "Close"]);
+    assert_eq!(
+        menu_labels(&state),
+        ["Pin", "Rename", "Copy chat ID", "Close"]
+    );
 
     choose(&mut state, "Pin");
     assert!(state.overlay.is_none());
@@ -152,8 +155,20 @@ fn agent_rename_starts_from_the_shown_name_and_a_manual_name_wins() {
     right_click_agent(&mut state, "pane_2");
     assert_eq!(
         menu_labels(&state),
-        ["Pin", "Rename", "Clear name", "Close"]
+        ["Pin", "Rename", "Clear name", "Copy chat ID", "Close"]
     );
+}
+
+#[test]
+fn copy_chat_id_asks_for_the_clicked_panes_session() {
+    let mut state = two_agent_state();
+    right_click_agent(&mut state, "pane_2");
+    let copy = choose(&mut state, "Copy chat ID");
+    assert!(state.overlay.is_none());
+    assert!(matches!(
+        &copy.actions[..],
+        [ClientShellAction::CopyAgentSessionId { pane_id }] if pane_id == "pane_2"
+    ));
 }
 
 #[test]

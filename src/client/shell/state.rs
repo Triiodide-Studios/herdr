@@ -260,6 +260,10 @@ pub(crate) enum ClientShellAction {
     StartChatTab {
         workspace_id: String,
     },
+    /// Copy the agent session id (the Claude session) of a local endpoint's pane to the clipboard.
+    CopyAgentSessionId {
+        pane_id: String,
+    },
 }
 
 #[derive(Default)]
@@ -533,6 +537,7 @@ pub(super) enum ClientContextMenuAction {
     ClosePane,
     TogglePin,
     NewChat,
+    CopyChatId,
 }
 
 #[derive(Debug)]
@@ -559,6 +564,8 @@ pub(super) enum ClientContextMenuTarget {
         pane_id: String,
         has_manual_label: bool,
         pinned: bool,
+        /// The chat id comes from the local server's socket API, so it is offered on the local endpoint only.
+        local: bool,
     },
     AgentPanel {
         workspace_id: String,
@@ -1847,7 +1854,7 @@ impl ClientShellState {
     ///
     /// Every assignment must go through this setter so a repeated identical
     /// message gets a fresh deadline instead of inheriting the previous one.
-    pub(super) fn set_endpoint_error(&mut self, message: impl Into<String>) {
+    pub(crate) fn set_endpoint_error(&mut self, message: impl Into<String>) {
         self.endpoint_error = Some(message.into());
         self.endpoint_error_deadline = Some(
             std::time::Instant::now() + std::time::Duration::from_secs(ENDPOINT_ERROR_TIMEOUT_SECS),

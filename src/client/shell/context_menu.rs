@@ -78,6 +78,7 @@ impl ClientContextMenuOverlay {
             ClientContextMenuTarget::Agent {
                 has_manual_label,
                 pinned,
+                local,
                 ..
             } => {
                 let mut items = vec![
@@ -86,6 +87,9 @@ impl ClientContextMenuOverlay {
                 ];
                 if *has_manual_label {
                     items.push(item("Clear name", Action::ClearPaneName));
+                }
+                if *local {
+                    items.push(item("Copy chat ID", Action::CopyChatId));
                 }
                 items.push(item("Close", Action::ClosePane));
                 items
@@ -200,6 +204,7 @@ impl ClientShellState {
                 pane_id,
                 has_manual_label,
                 pinned,
+                local: self.active_endpoint_id.is_local(),
             },
             x,
             y,
@@ -321,6 +326,9 @@ impl ClientShellState {
                 );
             }
             ClientContextMenuAction::RenamePane => self.open_pane_rename_overlay(pane_id, true),
+            ClientContextMenuAction::CopyChatId => outcome
+                .actions
+                .push(ClientShellAction::CopyAgentSessionId { pane_id }),
             ClientContextMenuAction::ClearPaneName => self.push_endpoint_method(
                 crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                     pane_id,
