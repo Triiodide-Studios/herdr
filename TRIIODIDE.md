@@ -3,7 +3,8 @@
 Stock [herdr](https://github.com/herdrdev/herdr) plus client-only changes to the agents panel. The branch
 `triiodide/agent-context-menu` sits on the upstream release tag it was built from (now `v0.9.3`).
 
-- Right-click an agent row: Pin / Unpin, Rename, Clear name (after a rename), Close.
+- Right-click an agent row: Pin / Unpin, Rename, Clear name (after a rename), Copy chat ID (the agent's
+  session id, e.g. what `claude --resume` takes; local machine only), Close.
   Pinned agents stay at the top, in pin order, under every sort and plugin view, with a 📌 on the row.
   Pins are saved per machine in the window's own preferences file.
 - A name given with Rename outranks names that integrations and plugins report.
