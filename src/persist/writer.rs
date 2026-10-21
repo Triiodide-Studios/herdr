@@ -218,7 +218,8 @@ fn copy_recovery(source: &mut impl io::Read, backup: &Path) -> io::Result<()> {
     result
 }
 
-fn recovery_files(directory: &Path) -> io::Result<Vec<(u128, PathBuf)>> {
+/// Recovery copies in `directory`, oldest first.
+pub(super) fn recovery_files(directory: &Path) -> io::Result<Vec<(u128, PathBuf)>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
