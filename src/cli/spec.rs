@@ -42,6 +42,20 @@ pub(super) fn command() -> Command {
         .subcommand(tab_command())
         .subcommand(notification_command())
         .subcommand(agent_command())
+        .subcommand(
+            Command::new("resolve")
+                .about("Print one line for an agent: pane, status, worktree, cwd, session and message pipe")
+                .arg(required("query", "NAME|PANE|CHAT|SESSION-ID")),
+        )
+        .subcommand(
+            Command::new("broadcast")
+                .about("Send one prompt to many agents and print a result per pane")
+                .override_usage("herdr broadcast --to <NAMES|all-active> <TEXT|FILE> [--dry-run]")
+                .arg(option("to", "NAMES|all-active").required(true))
+                .arg(required("text", "TEXT|FILE"))
+                .arg(flag("dry-run").help("List the panes that would receive it"))
+                .after_help("NAMES is a comma-separated list of agent names, pane ids, chat names or session ids. all-active is every agent with a Claude session that is not unknown, except the caller's own pane. If TEXT names a file, its contents are sent."),
+        )
         .subcommand(pane_command())
         .subcommand(terminal_command())
         .subcommand(session_command())
@@ -317,7 +331,12 @@ fn notification_command() -> Command {
 fn agent_command() -> Command {
     Command::new("agent")
         .about("Control and inspect agent panes")
-        .subcommand(Command::new("list").about("List agents"))
+        .subcommand(
+            Command::new("list")
+                .about("List agents")
+                .arg(flag("brief").help("One line per agent: pane, status, name, worktree"))
+                .arg(flag("full").help("The full JSON (default)")),
+        )
         .subcommand(id_command("get", "target", "Show an agent"))
         .subcommand(
             Command::new("read")
@@ -379,17 +398,24 @@ fn agent_command() -> Command {
         .subcommand(
             Command::new("wait")
                 .about("Wait until an agent reaches one of the requested states")
-                .override_usage("herdr agent wait <TARGET> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .override_usage("herdr agent wait <TARGET>... [OPTIONS]")
+                .arg(required("target", "TARGET").num_args(1..))
                 .arg(
                     option("until", "STATUS")
                         .action(ArgAction::Append)
                         .value_parser(["idle", "working", "blocked", "done", "unknown"])
                         .help("State to match; repeat for more than one state"),
                 )
+                .arg(
+                    option("any-of", "STATUS,STATUS")
+                        .action(ArgAction::Append)
+                        .help("Comma-separated states to match, for example blocked,done"),
+                )
                 .arg(option("timeout", "MS").help("Fail after this many milliseconds"))
+                .arg(flag("brief").help("One line instead of the agent JSON"))
+                .arg(flag("full").help("The agent JSON (default for one target)"))
                 .after_help(
-                    "Without --until, matches idle, done, or blocked. Use --until unknown explicitly when needed. Without --timeout, waits indefinitely.",
+                    "Without --until or --any-of, matches idle, done, or blocked. With --brief or several targets the first one to match prints '<pane> <status> <name>'. Without --timeout, waits indefinitely.",
                 ),
         )
         .subcommand(

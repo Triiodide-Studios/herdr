@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
+    AgentSendKeysParams, AgentStartParams, AgentTarget, ErrorBody,
     ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
@@ -16,14 +16,14 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match subcommand {
-        "list" => agent_list(&args[1..]),
+        "list" => super::fleet::agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
-        "wait" => agent_wait(&args[1..]),
+        "wait" => super::fleet::agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
         "explain" => agent_explain(&args[1..]),
@@ -435,18 +435,6 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-fn agent_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: herdr agent list");
-        return Ok(2);
-    }
-
-    super::print_response(&super::send_request(&Request {
-        id: "cli:agent:list".into(),
-        method: Method::AgentList(EmptyParams::default()),
-    })?)
-}
-
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!("usage: herdr agent get <target>");
@@ -501,62 +489,6 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
     };
     crate::client::run_terminal_attach(terminal_id.to_owned(), takeover)?;
     Ok(0)
-}
-
-fn agent_wait(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent wait <target> [--until STATUS]... [--timeout MS]");
-        return Ok(2);
-    };
-    let mut until = Vec::new();
-    let mut timeout_ms = None;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--until" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("--until requires at least one status");
-                    return Ok(2);
-                };
-                let status = match super::parse_agent_status(value) {
-                    Ok(status) => status,
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return Ok(2);
-                    }
-                };
-                until.push(status);
-                index += 2;
-            }
-            "--timeout" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --timeout");
-                    return Ok(2);
-                };
-                timeout_ms = match parse_timeout(value) {
-                    Ok(timeout_ms) => Some(timeout_ms),
-                    Err(exit_code) => return Ok(exit_code),
-                };
-                index += 2;
-            }
-            "help" | "--help" | "-h" => {
-                eprintln!("usage: herdr agent wait <target> [--until STATUS]... [--timeout MS]");
-                return Ok(0);
-            }
-            other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
-            }
-        }
-    }
-    super::print_response(&super::send_request(&Request {
-        id: "cli:agent:wait".into(),
-        method: Method::AgentWait(AgentWaitParams {
-            target: target.clone(),
-            until,
-            timeout_ms,
-        }),
-    })?)
 }
 
 fn wait_for_named_agent(
@@ -931,14 +863,14 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
 
 fn print_agent_help() {
     eprintln!("herdr agent commands:");
-    eprintln!("  herdr agent list");
+    eprintln!("  herdr agent list [--brief]");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
-    eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent wait <target>... [--any-of STATUS,STATUS | --until STATUS]... [--timeout MS] [--brief]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
