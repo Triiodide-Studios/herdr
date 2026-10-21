@@ -44,7 +44,7 @@ impl PendingIdleConfirmation {
         process_exited: bool,
         now: std::time::Instant,
     ) -> bool {
-        let is_working_to_plain_idle = previous.state == AgentState::Working
+        let is_working_to_plain_idle = matches!(previous.state, AgentState::Working | AgentState::Waiting)
             && next.state == AgentState::Idle
             && !next.visible_idle
             && !next.visible_blocker
@@ -475,6 +475,59 @@ mod tests {
         assert_eq!(
             decide_detection_screen_read(input),
             DetectionScreenReadDecision::Read
+        );
+    }
+
+    #[test]
+    fn a_wait_that_ends_is_held_like_a_turn_that_ends() {
+        let now = std::time::Instant::now();
+        let mut pending = PendingIdleConfirmation::default();
+        assert!(pending.should_hold_working_to_idle(
+            publish_state(AgentState::Waiting),
+            publish_state(AgentState::Idle),
+            false,
+            false,
+            now
+        ));
+    }
+
+    #[test]
+    fn a_turn_that_ends_waiting_and_a_wait_that_resumes_are_published_at_once() {
+        let now = std::time::Instant::now();
+        for (from, to) in [
+            (AgentState::Working, AgentState::Waiting),
+            (AgentState::Waiting, AgentState::Working),
+            (AgentState::Idle, AgentState::Waiting),
+        ] {
+            let mut pending = PendingIdleConfirmation::default();
+            let decision = decide_screen_detection_publish(
+                screen_publish_input(from, screen_detection(to), now),
+                &mut pending,
+            );
+            assert_eq!(
+                decision,
+                DetectionPublishDecision::Publish {
+                    state: to,
+                    visible_idle: false,
+                    visible_blocker: false,
+                    visible_working: to == AgentState::Working,
+                    process_exited: false,
+                },
+                "{from:?} to {to:?}"
+            );
+        }
+        // A wait that stays a wait publishes nothing.
+        let mut pending = PendingIdleConfirmation::default();
+        assert_eq!(
+            decide_screen_detection_publish(
+                screen_publish_input(
+                    AgentState::Waiting,
+                    screen_detection(AgentState::Waiting),
+                    now
+                ),
+                &mut pending
+            ),
+            DetectionPublishDecision::NoPublish
         );
     }
 

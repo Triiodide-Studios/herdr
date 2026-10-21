@@ -164,6 +164,45 @@ line_regex = ["^exact line$"]
 }
 
 #[test]
+fn a_rule_can_say_the_agent_waits_and_a_higher_priority_beats_working() {
+    with_manifest_dirs("waiting-state", || {
+        write_local_codex(&rules_manifest(
+            r#"
+[[rules]]
+id = "footer_working"
+state = "working"
+priority = 960
+contains = ["1 shell"]
+
+[[rules]]
+id = "marker_waiting"
+state = "waiting"
+priority = 961
+visible_working = true
+all = [{ contains = ["Waiting:"] }, { contains = ["1 shell"] }]
+"#,
+        ));
+
+        let waiting = explain(Agent::Codex, "Waiting: build\n1 shell");
+        assert_eq!(waiting.state, AgentState::Waiting);
+        assert_eq!(
+            waiting.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("marker_waiting")
+        );
+        // Only a working state is visibly working.
+        assert!(!waiting.visible_working);
+
+        let working = explain(Agent::Codex, "1 shell");
+        assert_eq!(working.state, AgentState::Working);
+        assert_eq!(agent_state_label(AgentState::Waiting), "waiting");
+        assert_eq!(
+            crate::detect::manifest::explain_to_json_value(&waiting)["state"],
+            "waiting"
+        );
+    });
+}
+
+#[test]
 fn remote_manifest_loads_between_local_override_and_bundled() {
     with_manifest_dirs("remote-source", || {
         write_remote_codex(&remote_manifest("9999.01.01.1", "blocked", "remote-ready"));

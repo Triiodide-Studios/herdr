@@ -36,4 +36,8 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Whether this server reports `waiting` as an agent status, and takes `state = "waiting"` in a detection manifest
+    /// rule. A plugin that writes such a rule checks this first: a server without it rejects the whole manifest.
+    #[serde(default)]
+    pub agent_status_waiting: bool,
 }

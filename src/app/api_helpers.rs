@@ -1,8 +1,9 @@
 pub(super) fn tab_attention_priority(state: crate::detect::AgentState, seen: bool) -> u8 {
     match (state, seen) {
-        (crate::detect::AgentState::Blocked, _) => 4,
-        (crate::detect::AgentState::Idle, false) => 3,
-        (crate::detect::AgentState::Working, _) => 2,
+        (crate::detect::AgentState::Blocked, _) => 5,
+        (crate::detect::AgentState::Idle, false) => 4,
+        (crate::detect::AgentState::Working, _) => 3,
+        (crate::detect::AgentState::Waiting, _) => 2,
         (crate::detect::AgentState::Idle, true) => 1,
         (crate::detect::AgentState::Unknown, _) => 0,
     }
@@ -101,6 +102,7 @@ pub(super) fn pane_agent_status(
         (crate::detect::AgentState::Idle, false) => crate::api::schema::AgentStatus::Done,
         (crate::detect::AgentState::Idle, true) => crate::api::schema::AgentStatus::Idle,
         (crate::detect::AgentState::Working, _) => crate::api::schema::AgentStatus::Working,
+        (crate::detect::AgentState::Waiting, _) => crate::api::schema::AgentStatus::Waiting,
         (crate::detect::AgentState::Blocked, _) => crate::api::schema::AgentStatus::Blocked,
         (crate::detect::AgentState::Unknown, _) => crate::api::schema::AgentStatus::Unknown,
     }
@@ -154,6 +156,35 @@ pub(crate) fn limit_snapshot_lines(
     crate::pane::TerminalReadSnapshot {
         text: lines[lines.len().saturating_sub(limit)..].concat(),
         truncated: lines.len() > limit,
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{pane_agent_status, tab_attention_priority};
+    use crate::api::schema::AgentStatus;
+    use crate::detect::AgentState;
+
+    #[test]
+    fn waiting_is_its_own_status_whether_or_not_it_was_seen() {
+        assert_eq!(
+            pane_agent_status(AgentState::Waiting, true),
+            AgentStatus::Waiting
+        );
+        assert_eq!(
+            pane_agent_status(AgentState::Waiting, false),
+            AgentStatus::Waiting
+        );
+    }
+
+    #[test]
+    fn waiting_ranks_between_working_and_idle() {
+        let rank = tab_attention_priority;
+        assert!(rank(AgentState::Blocked, true) > rank(AgentState::Idle, false));
+        assert!(rank(AgentState::Idle, false) > rank(AgentState::Working, true));
+        assert!(rank(AgentState::Working, true) > rank(AgentState::Waiting, true));
+        assert!(rank(AgentState::Waiting, true) > rank(AgentState::Idle, true));
+        assert!(rank(AgentState::Idle, true) > rank(AgentState::Unknown, true));
     }
 }
 

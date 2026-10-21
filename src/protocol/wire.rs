@@ -928,6 +928,7 @@ where
     Ok(match value.as_str() {
         "idle" => crate::api::schema::AgentStatus::Idle,
         "working" => crate::api::schema::AgentStatus::Working,
+        "waiting" => crate::api::schema::AgentStatus::Waiting,
         "blocked" => crate::api::schema::AgentStatus::Blocked,
         "done" => crate::api::schema::AgentStatus::Done,
         _ => crate::api::schema::AgentStatus::Unknown,

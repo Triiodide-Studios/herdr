@@ -17,6 +17,11 @@ pub enum AgentState {
     Blocked,
     /// Plain shell or unrecognized program.
     Unknown,
+    /// Agent ended its turn and waits on background work it started (a job, a wake-up, a reply). It takes a prompt
+    /// like an idle agent and counts as running like a working one: its pane is not finished, and the wait is not a
+    /// turn. Only a manifest rule says so; no integration reports it. Last, so the variants a saved session and an older
+    /// client or server know keep their positions in the binary encodings.
+    Waiting,
 }
 
 /// Screen-derived agent state plus confidence metadata used for source arbitration.

@@ -21,7 +21,10 @@ use super::state::{
 
 fn is_background_completion_transition(prev_state: AgentState, new_state: AgentState) -> bool {
     matches!(new_state, AgentState::Idle)
-        && matches!(prev_state, AgentState::Working | AgentState::Blocked)
+        && matches!(
+            prev_state,
+            AgentState::Working | AgentState::Waiting | AgentState::Blocked
+        )
 }
 
 fn is_completion_transition(change: &EffectiveStateChange) -> bool {
@@ -2989,6 +2992,65 @@ mod tests {
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
         ));
+    }
+
+    #[test]
+    fn a_wait_that_ends_in_the_background_marks_unseen_like_a_turn_that_ends() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.active = Some(0);
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let bg_terminal_id = state.workspaces[1]
+            .panes
+            .get(&bg_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&bg_terminal_id).unwrap().state = AgentState::Waiting;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
+        assert!(!pane.seen);
+        assert!(matches!(
+            state.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::Finished)
+        ));
+    }
+
+    #[test]
+    fn a_turn_that_ends_waiting_is_not_a_completion() {
+        // Working -> Waiting is no notification, and Waiting -> Working or back to Waiting none either; only the wait
+        // ending (Waiting -> Idle) is the agent finishing.
+        for (from, to) in [
+            (AgentState::Working, AgentState::Waiting),
+            (AgentState::Waiting, AgentState::Working),
+            (AgentState::Idle, AgentState::Waiting),
+            (AgentState::Waiting, AgentState::Unknown),
+        ] {
+            assert_eq!(notification_sound_for_state_change(false, from, to), None);
+            assert_eq!(notification_toast_for_state_change(false, from, to), None);
+        }
+        assert_eq!(
+            notification_sound_for_state_change(false, AgentState::Waiting, AgentState::Idle),
+            Some(crate::sound::Sound::Done)
+        );
+        assert_eq!(
+            notification_toast_for_state_change(false, AgentState::Waiting, AgentState::Idle),
+            Some(ToastKind::Finished)
+        );
+        assert_eq!(
+            notification_sound_for_state_change(false, AgentState::Waiting, AgentState::Blocked),
+            Some(crate::sound::Sound::Request)
+        );
     }
 
     #[test]

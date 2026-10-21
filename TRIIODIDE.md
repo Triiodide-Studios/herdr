@@ -29,11 +29,18 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus client-only changes to the
   matches a chat word it is close to in meaning as well as one it is the start of. A background thread
   in the window refreshes the index every 20 s (`src/client/chat_search/`); a refresh with nothing new
   reads only the bytes appended to each transcript.
+- A `waiting` agent status, for an agent that ended its turn waiting on background work it started (a job, a
+  scheduled wake-up, a reply from another session). `herdr agent list`, `agent get`, the dot (peach), the
+  position (between working and idle) and the status text all show it. Nothing reports it by itself: a detection
+  manifest rule says `state = "waiting"` (Luna's rules do, in `herdr-config\plugins\luna\manifest.go`), and
+  `herdr status server --json` has `agent_status_waiting: true` once the server knows it. A server without it
+  rejects such a manifest, so a rule writer checks the capability first. The variant is last in the enums, so
+  saved sessions and older clients keep decoding the statuses they know.
 
-Only the window (the client) changes. The server can stay the stock release of the same version, so
-installing the patched binary never restarts running panes: reopen the window to pick it up.
-Pins, New chat and chat search apply to the local machine only, not to remote machines added with
-`herdr machine add`.
+Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
+status also changes the server, and a server only takes a new binary by restarting, which restarts every pane
+(live handoff is not available on Windows). Pins, New chat and chat search apply to the local machine only, not
+to remote machines added with `herdr machine add`.
 
 ## Search model
 

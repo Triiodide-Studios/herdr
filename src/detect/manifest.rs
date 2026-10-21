@@ -220,6 +220,7 @@ enum ManifestState {
     Working,
     Blocked,
     Unknown,
+    Waiting,
 }
 
 impl From<ManifestState> for AgentState {
@@ -227,6 +228,7 @@ impl From<ManifestState> for AgentState {
         match value {
             ManifestState::Idle => AgentState::Idle,
             ManifestState::Working => AgentState::Working,
+            ManifestState::Waiting => AgentState::Waiting,
             ManifestState::Blocked => AgentState::Blocked,
             ManifestState::Unknown => AgentState::Unknown,
         }
@@ -817,6 +819,7 @@ pub fn agent_state_label(state: AgentState) -> &'static str {
     match state {
         AgentState::Idle => "idle",
         AgentState::Working => "working",
+        AgentState::Waiting => "waiting",
         AgentState::Blocked => "blocked",
         AgentState::Unknown => "unknown",
     }

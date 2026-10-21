@@ -163,6 +163,9 @@ pub enum AgentStatus {
     Blocked,
     Done,
     Unknown,
+    /// The agent ended its turn and waits on background work it started. Last, so the statuses an older client or server
+    /// knows keep their positions in the binary encodings.
+    Waiting,
 }
 
 pub(crate) fn default_true() -> bool {

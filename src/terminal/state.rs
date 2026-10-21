@@ -649,7 +649,9 @@ impl TerminalState {
             previous_presentation,
             now,
         );
-        if fallback_state == AgentState::Working && self.state == AgentState::Working {
+        if matches!(fallback_state, AgentState::Working | AgentState::Waiting)
+            && matches!(self.state, AgentState::Working | AgentState::Waiting)
+        {
             self.agent_process_acquisition_pending = false;
         }
         TerminalStateMutation {

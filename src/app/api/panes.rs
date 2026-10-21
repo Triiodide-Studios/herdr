@@ -2069,7 +2069,7 @@ fn normalize_state_labels(
             let status = status.trim().to_ascii_lowercase();
             if !matches!(
                 status.as_str(),
-                "idle" | "working" | "blocked" | "done" | "unknown"
+                "idle" | "working" | "waiting" | "blocked" | "done" | "unknown"
             ) {
                 return Err(status);
             }

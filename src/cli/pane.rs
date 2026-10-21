@@ -1561,7 +1561,7 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
                 let status = status.trim().to_ascii_lowercase();
                 if !matches!(
                     status.as_str(),
-                    "idle" | "working" | "blocked" | "done" | "unknown"
+                    "idle" | "working" | "waiting" | "blocked" | "done" | "unknown"
                 ) {
                     eprintln!("unknown state label: {status}");
                     return Ok(2);
