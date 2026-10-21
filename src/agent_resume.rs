@@ -196,18 +196,113 @@ pub fn session_ref_from_snapshot(
     })
 }
 
+/// Flags of a Claude Code process that a resumed session must be started with again. `claude --resume <id>` restores
+/// the conversation, and the model from its transcript, but not the effort or the permission mode: a restored pane came
+/// back at the model's default effort. Everything else on the command line (the session, the prompt, paths) is left out.
+const CLAUDE_VALUE_FLAGS: [&str; 3] = ["--model", "--effort", "--permission-mode"];
+const CLAUDE_SWITCH_FLAGS: [&str; 1] = ["--dangerously-skip-permissions"];
+const MAX_LAUNCH_ARG_VALUE_LEN: usize = 64;
+
+/// A value Herdr types back into a shell unquoted-safe: letters, digits and the punctuation of model names
+/// (`claude-opus-5-5`, `opus[1m]`).
+fn launch_arg_value_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_LAUNCH_ARG_VALUE_LEN
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'[' | b']')
+        })
+        && !value.starts_with('-')
+}
+
+/// The flags in `args` that a restored Claude session keeps, in a fixed order, as `["--model", "x", "--effort", "y"]`.
+/// A flag given twice keeps its last value, as the CLI does; a flag with a value that is missing or not safe to type
+/// back is dropped, never the whole list.
+fn claude_flags(args: &[String]) -> Vec<String> {
+    let mut values: Vec<Option<String>> = vec![None; CLAUDE_VALUE_FLAGS.len()];
+    let mut switches = [false; CLAUDE_SWITCH_FLAGS.len()];
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut consumed = 1;
+        if let Some(slot) = CLAUDE_VALUE_FLAGS.iter().position(|flag| *flag == arg) {
+            let value = args.get(index + 1).map(String::as_str);
+            values[slot] = value
+                .filter(|value| launch_arg_value_is_safe(value))
+                .map(String::from);
+            consumed = if value.is_some_and(|value| !value.starts_with('-')) {
+                2
+            } else {
+                1
+            };
+        } else if let Some(slot) = CLAUDE_VALUE_FLAGS.iter().position(|flag| {
+            arg.strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+        }) {
+            let value = &arg[CLAUDE_VALUE_FLAGS[slot].len() + 1..];
+            values[slot] = launch_arg_value_is_safe(value).then(|| value.to_string());
+        } else if let Some(slot) = CLAUDE_SWITCH_FLAGS.iter().position(|flag| *flag == arg) {
+            switches[slot] = true;
+        }
+        index += consumed;
+    }
+    let mut flags = Vec::new();
+    for (flag, value) in CLAUDE_VALUE_FLAGS.iter().zip(values) {
+        if let Some(value) = value {
+            flags.push((*flag).to_string());
+            flags.push(value);
+        }
+    }
+    for (flag, on) in CLAUDE_SWITCH_FLAGS.iter().zip(switches) {
+        if on {
+            flags.push((*flag).to_string());
+        }
+    }
+    flags
+}
+
+/// The flags to keep from the command line of a running Claude Code process (`argv[0]` is the program).
+pub fn claude_launch_args(argv: &[String]) -> Vec<String> {
+    claude_flags(argv.get(1..).unwrap_or_default())
+}
+
+/// The flags the Claude Code process in a pane's foreground job was started with, or `None` when the job has no Claude
+/// process whose command line could be read.
+pub fn claude_launch_args_in_job(job: &crate::platform::ForegroundJob) -> Option<Vec<String>> {
+    job.processes.iter().find_map(|process| {
+        let name = process.argv0.as_deref().unwrap_or(&process.name);
+        if crate::detect::identify_agent(name) != Some(crate::detect::Agent::Claude) {
+            return None;
+        }
+        process.argv.as_deref().map(claude_launch_args)
+    })
+}
+
 pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<AgentResumePlan> {
+    plan_with_launch_args(source, agent, session_ref, &[])
+}
+
+/// The command that resumes a session. `launch_args` are the flags the session's process was started with
+/// (`claude_launch_args`); Claude gets them again after `--resume`, other agents ignore them.
+pub fn plan_with_launch_args(
+    source: &str,
+    agent: &str,
+    session_ref: &AgentSessionRef,
+    launch_args: &[String],
+) -> Option<AgentResumePlan> {
     if !is_official_agent_source(source, agent) {
         return None;
     }
 
     let argv = match (source, agent, session_ref.kind) {
         ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
-            vec![
+            let mut argv = vec![
                 "claude".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
-            ]
+            ];
+            // The list is read back from session.json, which anyone can edit: sanitize it again.
+            argv.extend(claude_flags(launch_args));
+            argv
         }
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
             vec!["codex".into(), "resume".into(), session_ref.value.clone()]
@@ -448,6 +543,164 @@ mod tests {
             ]
         )
         .is_none());
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn claude_launch_args_keep_model_effort_and_permission_mode() {
+        let argv = args(&[
+            r"C:\Users\me\.local\bin\claude.exe",
+            "--resume",
+            "e5042d6c-961c-4613-9ad2-b0c820b87cb3",
+            "--model",
+            "claude-sonnet-5-5",
+            "--effort",
+            "xhigh",
+            "--permission-mode",
+            "auto",
+            "--dangerously-skip-permissions",
+        ]);
+        assert_eq!(
+            claude_launch_args(&argv),
+            args(&[
+                "--model",
+                "claude-sonnet-5-5",
+                "--effort",
+                "xhigh",
+                "--permission-mode",
+                "auto",
+                "--dangerously-skip-permissions",
+            ])
+        );
+    }
+
+    #[test]
+    fn claude_launch_args_come_out_in_a_fixed_order_and_the_last_value_wins() {
+        let argv = args(&[
+            "claude",
+            "--effort",
+            "low",
+            "--model=opus[1m]",
+            "--effort=high",
+            "--model",
+            "sonnet",
+        ]);
+        assert_eq!(
+            claude_launch_args(&argv),
+            args(&["--model", "sonnet", "--effort", "high"])
+        );
+    }
+
+    #[test]
+    fn claude_launch_args_leave_out_the_session_the_prompt_and_other_flags() {
+        let argv = args(&[
+            "claude",
+            "--resume",
+            "abc",
+            "-c",
+            "--session-id",
+            "def",
+            "--plugin-dir",
+            r"C:\mods\luna",
+            "-p",
+            "fix --model and --effort bugs",
+        ]);
+        assert!(claude_launch_args(&argv).is_empty());
+        assert!(claude_launch_args(&[]).is_empty());
+        assert!(claude_launch_args(&args(&["claude"])).is_empty());
+    }
+
+    #[test]
+    fn claude_launch_args_drop_a_flag_whose_value_is_missing_or_unsafe_not_the_list() {
+        let argv = args(&[
+            "claude",
+            "--model",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "it's",
+        ]);
+        assert_eq!(claude_launch_args(&argv), args(&["--effort", "high"]));
+        for unsafe_value in [
+            "a b",
+            "x;rm",
+            "$(x)",
+            "a'b",
+            "",
+            "-x",
+            "m".repeat(65).as_str(),
+        ] {
+            assert!(
+                claude_launch_args(&args(&["claude", "--model", unsafe_value])).is_empty(),
+                "{unsafe_value:?} was kept"
+            );
+        }
+        // Whatever is kept is something a resume command can carry.
+        let kept = plan_with_launch_args(
+            "herdr:claude",
+            "claude",
+            &AgentSessionRef::id("s").unwrap(),
+            &args(&["--model", "opus[1m]", "--effort", "xhigh"]),
+        )
+        .unwrap();
+        assert!(validate_resume_argv(&kept.argv).is_ok());
+    }
+
+    #[test]
+    fn claude_resume_carries_its_launch_args_and_other_agents_ignore_them() {
+        let session = AgentSessionRef::id("claude-session").unwrap();
+        let flags = args(&["--model", "claude-sonnet-5-5", "--effort", "xhigh"]);
+        let resumed = plan_with_launch_args("herdr:claude", "claude", &session, &flags).unwrap();
+        assert_eq!(
+            resumed.argv,
+            args(&[
+                "claude",
+                "--resume",
+                "claude-session",
+                "--model",
+                "claude-sonnet-5-5",
+                "--effort",
+                "xhigh"
+            ])
+        );
+        assert_eq!(
+            resumed.dedupe_key,
+            plan("herdr:claude", "claude", &session).unwrap().dedupe_key,
+            "the flags do not make a second session"
+        );
+        let codex = AgentSessionRef::id("codex-session").unwrap();
+        assert_eq!(
+            plan_with_launch_args("herdr:codex", "codex", &codex, &flags)
+                .unwrap()
+                .argv,
+            args(&["codex", "resume", "codex-session"])
+        );
+        // A hand-edited list is cleaned: only the known flags with safe values get through.
+        let edited = args(&[
+            "--dangerously-skip-permissions",
+            "--resume",
+            "other",
+            "--model",
+            "x y",
+            "--effort",
+            "low",
+        ]);
+        assert_eq!(
+            plan_with_launch_args("herdr:claude", "claude", &session, &edited)
+                .unwrap()
+                .argv,
+            args(&[
+                "claude",
+                "--resume",
+                "claude-session",
+                "--effort",
+                "low",
+                "--dangerously-skip-permissions"
+            ])
+        );
     }
 
     #[test]

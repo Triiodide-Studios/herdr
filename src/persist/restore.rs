@@ -455,6 +455,7 @@ fn unavailable_restored_terminal(
         terminal.launch_argv = pane.launch_argv.clone();
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
+            terminal.agent_launch_args = restored_launch_args(pane.agent_session.as_ref());
         }
         if let Some(resume) = saved_reported_resume(pane) {
             terminal.restore_reported_resume(reported_resume_from_snapshot(resume));
@@ -593,6 +594,7 @@ fn restore_tab(
             }
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
+                terminal.agent_launch_args = restored_launch_args(saved_agent_session);
             }
             if let Some(resume) = restored_agent_resume {
                 terminal.restore_reported_resume(resume);
@@ -693,6 +695,7 @@ fn restore_tab(
                 }
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
+                    terminal.agent_launch_args = restored_launch_args(saved_agent_session);
                 }
                 if let Some(resume) = restored_agent_resume {
                     terminal.restore_reported_resume(resume);
@@ -881,7 +884,12 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)
+    crate::agent_resume::plan_with_launch_args(
+        &session.source,
+        &session.agent,
+        &persisted.session_ref,
+        &session.launch_args,
+    )
 }
 
 fn persisted_agent_session_from_snapshot(
@@ -893,6 +901,10 @@ fn persisted_agent_session_from_snapshot(
         session.kind,
         &session.value,
     )
+}
+
+fn restored_launch_args(session: Option<&PaneAgentSessionSnapshot>) -> Vec<String> {
+    session.map(|session| session.launch_args.clone()).unwrap_or_default()
 }
 
 fn restored_terminal_agent_session(
@@ -1105,6 +1117,7 @@ mod tests {
     fn restore_plan_respects_opt_in_and_allowlist() {
         let pi_session_path = test_session_path("pi-session.jsonl");
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1118,6 +1131,7 @@ mod tests {
         );
 
         let unsupported_path = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:claude".into(),
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1130,6 +1144,7 @@ mod tests {
     fn restore_plan_selection_suppresses_duplicates() {
         let pi_session_path = test_session_path("pi-session.jsonl");
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1152,6 +1167,7 @@ mod tests {
     #[test]
     fn pane_restore_startup_suppresses_history_for_native_agent_resume() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1183,6 +1199,7 @@ mod tests {
     #[test]
     fn pane_restore_startup_suppresses_history_for_duplicate_native_agent_session() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1223,6 +1240,7 @@ mod tests {
     #[test]
     fn pane_restore_startup_prefers_reported_resume_argv() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1296,6 +1314,7 @@ mod tests {
     #[test]
     fn pane_restore_startup_keeps_history_without_native_agent_resume() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1328,6 +1347,7 @@ mod tests {
     #[test]
     fn restore_rehydrates_agent_session_metadata() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
@@ -1344,6 +1364,7 @@ mod tests {
     #[test]
     fn restore_does_not_rehydrate_duplicate_agent_session_metadata() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_args: Vec::new(),
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
@@ -1378,6 +1399,7 @@ mod tests {
             failed.cwd = missing.clone();
             failed.label = Some("keep my pane".into());
             failed.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                launch_args: Vec::new(),
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
@@ -1467,6 +1489,7 @@ mod tests {
                             agent_name: Some("reviewer".into()),
                             managed_agent_kind: Some("opencode".into()),
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                launch_args: Vec::new(),
                                 source: "herdr:opencode".into(),
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
@@ -1631,6 +1654,7 @@ mod tests {
             agent_name: Some("planner".into()),
             managed_agent_kind: None,
             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                launch_args: Vec::new(),
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
@@ -1783,6 +1807,7 @@ mod tests {
                             agent_name: None,
                             managed_agent_kind: None,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                launch_args: Vec::new(),
                                 source: "herdr:codex".into(),
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,

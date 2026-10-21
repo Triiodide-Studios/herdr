@@ -137,6 +137,8 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    /// Launch flags of the agent process that reported `persisted_agent_session`, saved so a restore repeats them.
+    pub agent_launch_args: Vec<String>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
     pub terminal_title: Option<String>,
@@ -177,6 +179,7 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            agent_launch_args: Vec::new(),
             reported_resume: None,
             reported_resume_revision: 0,
             terminal_title: None,

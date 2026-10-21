@@ -1612,6 +1612,12 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let launch_args = (agent_label == "claude")
+            .then(|| self.lookup_runtime(ws_idx, pane_id))
+            .flatten()
+            .and_then(|(runtime, _workspace_id)| {
+                super::super::agents::live_claude_launch_args(runtime)
+            });
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1621,6 +1627,7 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            launch_args,
         });
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());

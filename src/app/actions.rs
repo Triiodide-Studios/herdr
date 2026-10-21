@@ -1529,8 +1529,12 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
-            } => self
-                .update_terminal_state(pane_id, |terminal| {
+                launch_args,
+            } => {
+                self.update_terminal_state(pane_id, |terminal| {
+                    if let Some(launch_args) = launch_args {
+                        terminal.agent_launch_args = launch_args;
+                    }
                     terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
@@ -1540,7 +1544,8 @@ impl AppState {
                     )
                 })
                 .into_iter()
-                .collect(),
+                .collect()
+            }
             AppEvent::HookMetadataReported {
                 pane_id,
                 source,
@@ -3240,6 +3245,7 @@ mod tests {
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
                 session_start_source: Some(reason.into()),
+                launch_args: None,
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {

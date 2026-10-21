@@ -435,6 +435,13 @@ pub(super) fn runtime_hosts_agent(
     live_runtime_agent(runtime) == Some(expected)
 }
 
+pub(super) fn live_claude_launch_args(
+    runtime: &crate::terminal::TerminalRuntime,
+) -> Option<Vec<String>> {
+    let job = crate::detect::foreground_job(runtime.child_pid()?)?;
+    crate::agent_resume::claude_launch_args_in_job(&job)
+}
+
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
     let job = crate::detect::foreground_job(runtime.child_pid()?)?;
     crate::detect::identify_agent_in_job(&job)

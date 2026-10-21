@@ -126,6 +126,10 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// Flags the agent process was launched with that its resume command must repeat
+    /// (`agent_resume::claude_launch_args`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -358,6 +362,7 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        launch_args: terminal.agent_launch_args.clone(),
                     });
                 }
             }
@@ -369,6 +374,7 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    launch_args: terminal.agent_launch_args.clone(),
                 })
         });
         let agent_resume = terminal
@@ -1370,6 +1376,68 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Id
         );
         assert_eq!(agent_session.value, "opencode-session");
+        assert!(agent_session.launch_args.is_empty());
+    }
+
+    #[test]
+    fn claude_launch_args_round_trip_through_session_json() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+        });
+        terminal.agent_launch_args = crate::agent_resume::claude_launch_args(&[
+            "claude".into(),
+            "--model".into(),
+            "sonnet".into(),
+            "--effort".into(),
+            "xhigh".into(),
+        ]);
+
+        let json = serde_json::to_string_pretty(&capture_from_state(&state)).unwrap();
+        let snapshot = parse_snapshot(&json).unwrap();
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("persisted agent session should be captured");
+
+        assert_eq!(
+            agent_session.launch_args,
+            vec!["--model", "sonnet", "--effort", "xhigh"]
+        );
+        assert_eq!(
+            crate::agent_resume::plan_with_launch_args(
+                &agent_session.source,
+                &agent_session.agent,
+                &crate::agent_resume::AgentSessionRef::id(agent_session.value.clone()).unwrap(),
+                &agent_session.launch_args,
+            )
+            .unwrap()
+            .argv,
+            vec![
+                "claude",
+                "--resume",
+                "claude-session",
+                "--model",
+                "sonnet",
+                "--effort",
+                "xhigh"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_json_without_launch_args_still_loads() {
+        let json = r#"{"source":"herdr:claude","agent":"claude","kind":"id","value":"claude-session"}"#;
+        let session: PaneAgentSessionSnapshot = serde_json::from_str(json).unwrap();
+        assert!(session.launch_args.is_empty());
     }
 
     #[test]
