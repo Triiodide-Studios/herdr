@@ -143,6 +143,10 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        #[cfg(windows)]
+        if terminal.effective_known_agent() == Some(crate::detect::Agent::Claude) {
+            return self.queue_claude_message(id, &params);
+        }
         if terminal.state == crate::detect::AgentState::Blocked {
             return Err(encode_error(
                 id,
@@ -168,6 +172,21 @@ impl App {
                 "agent_not_ready",
                 format!(
                     "agent {} is no longer the pane foreground process",
+                    params.target
+                ),
+            ));
+        }
+        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.target));
+        };
+        // Typed text goes into the input box of the agent that has the user's keyboard, where it joins whatever is being typed
+        // and the Enter submits it all. A Claude agent is sent a message instead (queue_claude_message); this is every other.
+        if agent.focused {
+            return Err(encode_error(
+                id,
+                "agent_input_busy",
+                format!(
+                    "agent {} is the pane the user is working in: its input box may hold what they are typing, so herdr does not type into it",
                     params.target
                 ),
             ));
@@ -201,9 +220,6 @@ impl App {
         } else {
             text
         };
-        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
-            return Err(agent_not_found(id, &params.target));
-        };
         let completion = runtime
             .queue_user_input_submission(
                 Bytes::from(text),
@@ -212,6 +228,60 @@ impl App {
                 submit_deadline,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        Ok((id, agent, completion))
+    }
+
+    /// A prompt for a Claude Code agent goes to the session as a cross-session message, never as keystrokes: typed text lands in
+    /// the input box, among whatever its user is typing, and the Enter submits it all. A message waits in the session's own
+    /// queue and reaches the agent at its next tool round, or wakes it when it is idle. The agent need not be unblocked or the
+    /// foreground process of its pane: the message is not typed into anything. It is sent from a thread, as a busy pipe is
+    /// retried for seconds.
+    #[cfg(windows)]
+    fn queue_claude_message(
+        &mut self,
+        id: String,
+        params: &AgentPromptParams,
+    ) -> Result<
+        (
+            String,
+            crate::api::schema::AgentInfo,
+            std::sync::mpsc::Receiver<std::io::Result<()>>,
+        ),
+        String,
+    > {
+        let resolved = match self.resolve_agent_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
+        };
+        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.target));
+        };
+        let Some(session) = agent.agent_session.as_ref().map(|session| session.value.clone())
+        else {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!("agent {} has not reported its Claude session yet", params.target),
+            ));
+        };
+        let Some(dir) = crate::claude_peer::sessions_dir() else {
+            return Err(encode_error(
+                id,
+                "agent_prompt_failed",
+                "no home folder to find the Claude Code sessions in",
+            ));
+        };
+        let text = params.text.clone();
+        let (done, completion) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let sent = crate::claude_peer::deliver(
+                &session,
+                &text,
+                &dir,
+                &crate::claude_peer::Machine::current(),
+            );
+            let _ = done.send(sent.map_err(|err| std::io::Error::other(err.to_string())));
+        });
         Ok((id, agent, completion))
     }
 
@@ -443,6 +513,7 @@ mod tests {
     #[tokio::test]
     async fn windows_codex_prompt_flushes_paste_burst_before_enter() {
         let mut app = app_with_agent();
+        app.state.active = None;
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
@@ -537,6 +608,7 @@ mod tests {
     #[tokio::test]
     async fn agent_prompt_sends_text_then_delays_enter() {
         let mut app = app_with_agent();
+        app.state.active = None;
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
@@ -611,6 +683,223 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    // A prompt to a Claude Code agent is a cross-session message, not keystrokes: the text that is in the pane's input box
+    // (what its user is typing) is untouched, no byte reaches the pane, and the message reaches the session's pipe.
+    #[cfg(windows)]
+    mod claude_message {
+        use super::*;
+        use crate::claude_peer::{key_file_name, Machine, PeerError, TEST_MACHINE};
+        use crate::agent_resume::{AgentSessionRef, PersistedAgentSession};
+        use std::sync::Mutex;
+
+        const SESSION: &str = "3c53fb2a-3fd1-4dc5-a857-064c412e0162";
+        const PIPE: &str = r"\\.\pipe\LOCAL\cc-msg-774131b569a4d0ab92d8d71730bc96c9";
+        const STARTED: u64 = 134370848602109159;
+
+        static SENT: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+        fn write(pipe: &str, bytes: &[u8]) -> Result<(), PeerError> {
+            SENT.lock()
+                .unwrap()
+                .push((pipe.to_owned(), String::from_utf8(bytes.to_vec()).unwrap()));
+            Ok(())
+        }
+
+        fn running(_pid: u32) -> Option<u64> {
+            Some(STARTED)
+        }
+
+        /// A sessions folder with the session's record and key, the fake machine, and the env a send reads; undone on drop.
+        struct Fixture {
+            dir: std::path::PathBuf,
+            _env: std::sync::MutexGuard<'static, ()>,
+        }
+
+        impl Fixture {
+            fn new(with_session: bool) -> Self {
+                let env = crate::config::test_config_env_lock()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let dir = std::env::temp_dir().join(format!(
+                    "herdr-claude-message-{}-{}",
+                    std::process::id(),
+                    SENT.lock().unwrap().len()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                if with_session {
+                    std::fs::write(
+                        dir.join("105968.json"),
+                        format!(
+                            r#"{{"pid":105968,"sessionId":"{SESSION}","messagingSocketPath":{PIPE:?},"procStart":"{STARTED}","pidDomain":"win32:test"}}"#
+                        ),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        dir.join(key_file_name(105968, PIPE)),
+                        format!(r#"{{"peerToken":"0123456789abcdef0123456789abcdef","procStartFt":{STARTED},"pidDomain":"win32:test"}}"#),
+                    )
+                    .unwrap();
+                }
+                std::env::set_var("HERDR_CLAUDE_SESSIONS_DIR", &dir);
+                *TEST_MACHINE.lock().unwrap() = Some(Machine {
+                    process_start: running,
+                    write_pipe: write,
+                });
+                SENT.lock().unwrap().clear();
+                Self { dir, _env: env }
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                *TEST_MACHINE.lock().unwrap() = None;
+                std::env::remove_var("HERDR_CLAUDE_SESSIONS_DIR");
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        /// A Claude agent in the pane the user is working in, whose input box shows `typed`.
+        fn claude_pane(typed: &[u8], state: AgentState) -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+            let mut app = app_with_agent();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name("reviewer".into());
+            terminal.set_detected_state(Some(Agent::Claude), state);
+            terminal.set_persisted_agent_session(PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: AgentSessionRef::id(SESSION).unwrap(),
+            });
+            let (runtime, rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    80, 24, 0, typed, 4,
+                );
+            app.state.insert_test_runtime(pane_id, runtime);
+            (app, rx)
+        }
+
+        fn prompt(app: &mut App, text: &str) -> String {
+            run_deferred_agent_prompt(
+                app,
+                "req",
+                AgentPromptParams {
+                    target: "reviewer".into(),
+                    text: text.into(),
+                    wait: None,
+                },
+            )
+        }
+
+        async fn nothing_typed(rx: &mut tokio::sync::mpsc::Receiver<Bytes>) -> bool {
+            tokio::time::timeout(AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(150), rx.recv())
+                .await
+                .is_err()
+        }
+
+        #[tokio::test]
+        async fn a_prompt_leaves_the_text_in_the_input_box_untouched_and_still_arrives() {
+            let _fixture = Fixture::new(true);
+            let (mut app, mut rx) = claude_pane(b"> fix the door in level 4 and also", AgentState::Idle);
+            let response = prompt(&mut app, "[bet land] Your land did not submit: <CL> 22890");
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert!(
+                matches!(success.result, ResponseResult::AgentPrompted { .. }),
+                "{response}"
+            );
+
+            assert!(nothing_typed(&mut rx).await, "bytes reached the pane: its input box was written to");
+            let sent = SENT.lock().unwrap();
+            assert_eq!(sent.len(), 1, "one message");
+            let (pipe, wire) = &sent[0];
+            assert_eq!(pipe, PIPE);
+            let lines: Vec<&str> = wire.split_terminator('\n').collect();
+            assert_eq!(lines.len(), 2, "{wire:?}");
+            assert!(lines[0].contains("\"auth\"") && lines[0].contains("0123456789abcdef0123456789abcdef"));
+            let message: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(
+                message["message"]["content"],
+                "<cross-session-message>\n[bet land] Your land did not submit: <CL> 22890\n</cross-session-message>"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_agent_waiting_on_a_prompt_still_gets_the_message_and_nothing_is_typed() {
+            let _fixture = Fixture::new(true);
+            let (mut app, mut rx) = claude_pane(b"Do you want to proceed? 1. Yes", AgentState::Blocked);
+            let response = prompt(&mut app, "wake up");
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert!(matches!(success.result, ResponseResult::AgentPrompted { .. }), "{response}");
+            assert!(nothing_typed(&mut rx).await, "an answer was typed into the blocking prompt");
+            assert_eq!(SENT.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_session_that_cannot_be_reached_is_an_error_and_nothing_is_typed() {
+            let _fixture = Fixture::new(false);
+            let (mut app, mut rx) = claude_pane(b"> half typed", AgentState::Idle);
+            let response = prompt(&mut app, "wake up");
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "agent_prompt_failed");
+            assert!(error.error.message.contains("no Claude Code session record"), "{}", error.error.message);
+            assert!(nothing_typed(&mut rx).await, "the prompt fell back to typing");
+            assert!(SENT.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_agent_with_no_session_yet_is_not_ready_and_nothing_is_typed() {
+            let _fixture = Fixture::new(true);
+            let (mut app, mut rx) = claude_pane(b"", AgentState::Idle);
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            app.state.terminals.get_mut(&terminal_id).unwrap().persisted_agent_session = None;
+            let response = prompt(&mut app, "wake up");
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "agent_not_ready");
+            assert!(nothing_typed(&mut rx).await);
+        }
+    }
+
+    // Any other agent is typed to, and only when the user is not in its pane: its input box may hold what they are typing.
+    #[tokio::test]
+    async fn agent_prompt_does_not_type_into_the_pane_the_user_is_working_in() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let params = || AgentPromptParams {
+            target: "reviewer".into(),
+            text: "A != B".into(),
+            wait: None,
+        };
+        let refused = run_deferred_agent_prompt(&mut app, "req", params());
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&refused).unwrap();
+        assert_eq!(error.error.code, "agent_input_busy");
+        assert!(
+            tokio::time::timeout(AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "text was typed into the focused pane"
+        );
+
+        app.state.active = None;
+        let accepted = run_deferred_agent_prompt(&mut app, "req", params());
+        let success: SuccessResponse = serde_json::from_str(&accepted).unwrap();
+        assert!(matches!(success.result, ResponseResult::AgentPrompted { .. }), "{accepted}");
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B"));
+    }
+
     #[tokio::test]
     async fn agent_prompt_rejects_blocked_agent_without_writing() {
         let mut app = app_with_agent();
@@ -650,6 +939,7 @@ mod tests {
     #[tokio::test]
     async fn agent_prompt_focuses_copilot_before_submitting() {
         let mut app = app_with_agent();
+        app.state.active = None;
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id

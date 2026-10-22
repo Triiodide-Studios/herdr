@@ -90,7 +90,7 @@ pub(super) fn parse_agent_rows(response: &serde_json::Value) -> Vec<AgentRow> {
         .unwrap_or_default()
 }
 
-pub(super) fn sessions_dir() -> Option<PathBuf> {
+pub(crate) fn sessions_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("HERDR_CLAUDE_SESSIONS_DIR") {
         return Some(PathBuf::from(dir));
     }

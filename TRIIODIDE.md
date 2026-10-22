@@ -37,6 +37,14 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus client-only changes to the
   rejects such a manifest, so a rule writer checks the capability first. The variant is last in the enums, so
   saved sessions and older clients keep decoding the statuses they know.
 
+- `herdr agent prompt` (and `herdr broadcast`, Luna, bet's land wake, the ledger monitors: everything that prompts an agent) sends a
+  Claude Code agent a cross-session message, the channel the SendMessage tool uses (`src/claude_peer.rs`: the session's record
+  and key in `~/.claude/sessions`, its message pipe). It arrives as "Another Claude session sent a message" and never touches the
+  input box, so it cannot land in what the user is typing and submit it; a blocked agent still queues it. A Claude session that
+  cannot take a message (no live record or key, a busy pipe) is an error (`agent_prompt_failed`), never typed. Every other agent is
+  typed to, and not in the pane the user is working in (`agent_input_busy`; whether its box holds text is not known). Windows only;
+  other platforms still type. The receiver treats the message as a teammate's, not the user's own words.
+
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
 status also changes the server, and a server only takes a new binary by restarting, which restarts every pane
 (live handoff is not available on Windows). Pins, New chat and chat search apply to the local machine only, not

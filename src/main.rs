@@ -17,6 +17,8 @@ mod api;
 mod app;
 mod build_info;
 mod checksum;
+#[cfg(windows)]
+mod claude_peer;
 mod cli;
 mod client;
 mod config;
