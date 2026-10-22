@@ -4,7 +4,9 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-fn workspace_selection_background(palette: &Palette) -> ratatui::style::Color {
+pub(in crate::client::shell) fn workspace_selection_background(
+    palette: &Palette,
+) -> ratatui::style::Color {
     if palette.selection_bg == ratatui::style::Color::Reset {
         palette.active_row_bg
     } else {
@@ -431,14 +433,25 @@ pub(crate) fn render_sidebar(
         }
     }
 
+    let (search_area, agent_area) = super::super::chat_search_box::split_detail_area(detail_area);
+    super::super::chat_search_box::render_section(
+        buffer,
+        search_area,
+        state.chat_search,
+        config,
+        hits,
+    );
+    let filter = state.chat_search.agent_filter(snapshot.agents.len());
     super::render_agent_panel(
         buffer,
-        detail_area,
+        agent_area,
         snapshot,
         config,
         state.agent_scroll,
+        filter.as_ref(),
         hits,
     );
+    state.chat_search.reveal_done();
 
     hits.sidebar_toggle = Rect::new(
         area.right().saturating_sub(2),

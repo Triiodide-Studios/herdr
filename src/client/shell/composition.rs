@@ -77,6 +77,7 @@ impl ClientShellState {
             reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
             dragged_workspace_id: None,
             workspace_drop_indicator_row: None,
+            chat_search: &mut self.chat_search,
         };
         if let Some(snapshot) = local_snapshot {
             render::render_sidebar(
@@ -186,6 +187,7 @@ impl ClientShellState {
             return None;
         }
         let layout = self.layout(cols, rows);
+        self.chat_search.refresh(snapshot);
         if self.last_tab_bar_width != Some(layout.tab_bar.width) {
             self.last_tab_bar_width = Some(layout.tab_bar.width);
             self.reveal_focused_tab = true;
@@ -233,8 +235,13 @@ impl ClientShellState {
                 reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
+                chat_search: &mut self.chat_search,
             },
         );
+        if self.chat_search.is_focused() && self.hits.chat_search.is_empty() {
+            // The box was not drawn (sidebar collapsed or too short): it cannot keep the keyboard.
+            self.chat_search.blur();
+        }
         self.hits.panes = surface
             .panes
             .iter()
@@ -641,6 +648,9 @@ impl ClientShellState {
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         if let Some(bar) = mode_bar {
             occlusion.cover(bar);
+        }
+        if self.chat_search_has_keyboard() {
+            frame.cursor = self.hits.chat_search_cursor.clone();
         }
         if let Some(overlay) = self.overlay.as_ref() {
             let mut composed = frame.to_ratatui_buffer()?;

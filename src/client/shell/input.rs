@@ -457,6 +457,9 @@ impl ClientShellState {
         {
             return true;
         }
+        if self.chat_search_has_keyboard() {
+            return true;
+        }
         matches!(
             self.overlay.as_ref(),
             Some(ClientShellOverlay::Rename(_))
@@ -530,6 +533,10 @@ impl ClientShellState {
         }
         if self.overlay.is_some() {
             self.route_overlay_key(key, outcome);
+            return None;
+        }
+        if self.chat_search_has_keyboard() {
+            self.route_chat_search_key(key, outcome);
             return None;
         }
         if matches!(key.code, KeyCode::Modifier(_)) {
@@ -963,6 +970,7 @@ impl ClientShellState {
                 .selection
                 .as_ref()
                 .is_some_and(crate::selection::Selection::is_visible),
+            chat_search_focused: self.chat_search.is_focused(),
         }
     }
 

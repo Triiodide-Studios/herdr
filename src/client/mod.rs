@@ -14,6 +14,7 @@
 
 mod attach;
 mod catalog_reload;
+pub(crate) mod chat_search;
 mod clipboard_forwarding;
 mod clipboard_images;
 mod config_reload;
@@ -183,6 +184,11 @@ fn run_client_with_mode(
             .with_startup_onboarding(loaded_config.config.should_show_onboarding())
             .with_keybinding_source(keybinding_source)
             .with_local_endpoint(&socket_path)
+            .with_chat_search(if is_remote_client_process() {
+                chat_search::ChatSearchIndex::inert()
+            } else {
+                chat_search::ChatSearchIndex::start()
+            })
     });
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();

@@ -53,6 +53,8 @@ pub(crate) struct ClientShellConfig {
     pub(super) preferences: preferences::ClientChromePreferences,
     pub(super) startup_config_diagnostic: Option<String>,
     pub(super) startup_onboarding: bool,
+    /// The chats the sidebar search looks through; an inert one finds nothing.
+    pub(super) chat_search: crate::client::chat_search::ChatSearchIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +90,9 @@ pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
+    pub(super) chat_search: Rect,
+    pub(super) chat_search_clear: Rect,
+    pub(super) chat_search_cursor: Option<crate::protocol::CursorState>,
     pub(super) workspace_scrollbar: Rect,
     pub(super) workspace_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) workspace_max_scroll: usize,
@@ -772,6 +777,7 @@ pub(super) struct ClientInputContext {
     pub(super) popup_terminal_id: Option<String>,
     pub(super) popup_pending: bool,
     pub(super) retained_selection: bool,
+    pub(super) chat_search_focused: bool,
 }
 
 type ClientInputLeases = crate::input::InputLeaseTable<u8, ClientInputContext, ClientInputTarget>;
@@ -914,6 +920,7 @@ pub(crate) struct ClientShellState {
     pub(super) pending_workspace_highlight: Option<PendingWorkspaceHighlight>,
     pub(super) reveal_navigation_workspace: bool,
     pub(super) overlay: Option<ClientShellOverlay>,
+    pub(super) chat_search: super::chat_search_box::ChatSearchState,
     pub(super) previous_pane_id: Option<String>,
     pub(super) pane_mouse_gesture: Option<ClientPaneMouseGesture>,
     pub(super) link_hover: Option<super::link_hover::LinkHover>,
@@ -1015,12 +1022,13 @@ impl ClientShellState {
         let sidebar_section_split = preferences
             .sidebar_section_split
             .filter(|split| split.is_finite())
-            .map(|split| split.clamp(0.1, 0.9))
+            .map(|split| split.clamp(0.0, 0.9))
             .unwrap_or(0.5);
         if let Some(sort) = preferences.agent_panel_sort {
             config.agent_panel_sort = sort;
         }
         config.pinned_agents = preferences.pinned_agents.clone();
+        let chat_search = super::chat_search_box::ChatSearchState::new(config.chat_search.clone());
         let mut remote_collapsed_groups = HashMap::<ClientEndpointId, HashSet<String>>::new();
         for saved in preferences.remote_collapsed_groups {
             let Ok(profile_id) = crate::client::endpoint::ProfileId::parse(saved.profile_id) else {
@@ -1080,6 +1088,7 @@ impl ClientShellState {
             pending_workspace_highlight: None,
             reveal_navigation_workspace: false,
             overlay,
+            chat_search,
             previous_pane_id: None,
             pane_mouse_gesture: None,
             link_hover: None,

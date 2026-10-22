@@ -27,7 +27,7 @@ impl ClientShellState {
             return;
         }
         let ratio = row.saturating_sub(divider.y) as f32 / divider.height as f32;
-        let ratio = ratio.clamp(0.1, 0.9);
+        let ratio = ratio.clamp(0.0, 0.9);
         if (self.sidebar_section_split - ratio).abs() > f32::EPSILON {
             self.sidebar_section_split = ratio;
             self.sidebar_section_split_manual = true;
@@ -1926,6 +1926,9 @@ impl ClientShellState {
                 self.workspace_press = None;
                 self.tab_press = None;
                 self.chrome_drag = None;
+                if self.overlay.is_none() && self.handle_chat_search_click(point, outcome) {
+                    return;
+                }
                 if super::contains(self.hits.sidebar_divider, point)
                     && !super::contains(self.hits.sidebar_toggle, point)
                 {

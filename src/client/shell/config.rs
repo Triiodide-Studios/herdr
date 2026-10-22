@@ -161,7 +161,16 @@ impl ClientShellConfig {
             preferences: preferences::ClientChromePreferences::default(),
             startup_config_diagnostic: None,
             startup_onboarding: false,
+            chat_search: crate::client::chat_search::ChatSearchIndex::inert(),
         }
+    }
+
+    pub(crate) fn with_chat_search(
+        mut self,
+        index: crate::client::chat_search::ChatSearchIndex,
+    ) -> Self {
+        self.chat_search = index;
+        self
     }
 
     pub(crate) fn with_startup_config_diagnostic(mut self, diagnostic: Option<String>) -> Self {

@@ -70,6 +70,7 @@ pub(super) fn render_expanded(
         config,
         agent_scroll,
         hits,
+        None,
         |row| row.agent.rows.len(),
         |buffer, rect, row, hits| {
             super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);

@@ -14,8 +14,21 @@ pub(super) struct AgentRow {
     pub(super) pane_id: String,
     pub(super) status: crate::api::schema::AgentStatus,
     pub(super) focused: bool,
+    /// The search's highlighted result.
+    pub(super) selected: bool,
     pub(super) pinned: bool,
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
+}
+
+/// A search's answer for the agents panel: the chats to list, in this order, instead of every agent.
+pub(super) struct AgentFilter<'a> {
+    pub(super) pane_ids: &'a [String],
+    /// Shown in place of the sort label.
+    pub(super) label: String,
+    pub(super) highlighted: Option<&'a str>,
+    /// Scroll the list to the highlighted row.
+    pub(super) reveal_highlighted: bool,
+    pub(super) empty_message: &'static str,
 }
 
 const PIN_MARKER: &str = "📌";
@@ -75,30 +88,48 @@ pub(super) fn render_agent_panel(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
+    filter: Option<&AgentFilter<'_>>,
     hits: &mut ShellHitMap,
 ) {
-    if !render_agent_panel_header(
-        buffer,
-        area,
-        snapshot.agent_view_label.as_deref(),
-        config,
-        hits,
-    ) {
+    let label = filter
+        .map(|filter| filter.label.as_str())
+        .or(snapshot.agent_view_label.as_deref());
+    if !render_agent_panel_header(buffer, area, label, config, hits) {
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
+    let mut rows = match filter {
+        Some(filter) => filter
+            .pane_ids
+            .iter()
+            .filter_map(|pane_id| agent_row(snapshot, pane_id, config, None))
+            .collect(),
+        None => agent_rows(snapshot, config, None),
+    };
+    if let Some(highlighted) = filter.and_then(|filter| filter.highlighted) {
+        for row in &mut rows {
+            row.selected = row.pane_id == highlighted;
+        }
+    }
+    let reveal = filter
+        .filter(|filter| filter.reveal_highlighted)
+        .and_then(|_| rows.iter().position(|row| row.selected));
+    let empty_message = match filter {
+        Some(filter) => Some(filter.empty_message),
+        None => snapshot
+            .agent_view_label
+            .as_ref()
+            .map(|_| " no matching agents"),
+    };
     render_agent_list(
         buffer,
         area,
         &rows,
-        snapshot
-            .agent_view_label
-            .as_ref()
-            .map(|_| " no matching agents"),
+        empty_message,
         config,
         agent_scroll,
         hits,
+        reveal,
         |row| row.rows.len(),
         |buffer, rect, row, hits| {
             hits.agents.push((rect, row.pane_id.clone()));
@@ -179,6 +210,7 @@ pub(super) fn render_agent_list<T>(
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
+    reveal: Option<usize>,
     row_lines: impl Fn(&T) -> usize,
     mut render_row: impl FnMut(&mut Buffer, Rect, &T, &mut ShellHitMap),
 ) {
@@ -221,6 +253,15 @@ pub(super) fn render_agent_list<T>(
             }
         })
         .collect::<Vec<_>>();
+    if let Some(target) = reveal {
+        *agent_scroll = super::scroll::list_scroll_start_to_reveal(
+            &row_heights,
+            &gaps,
+            body.height,
+            *agent_scroll,
+            target,
+        );
+    }
     let metrics =
         super::scroll::list_scroll_metrics(&row_heights, &gaps, body.height, *agent_scroll);
     hits.agent_max_scroll = metrics.max_offset_from_bottom;
@@ -335,6 +376,7 @@ pub(super) fn agent_row(
         pane_id: agent.pane_id.clone(),
         status: agent.agent_status,
         focused: agent.focused,
+        selected: false,
         // Pins are kept per local endpoint; aggregated machine rows (machine set) are never pinned.
         pinned: machine.is_none() && config.pinned_agents.contains(&agent.pane_id),
         rows,
@@ -348,7 +390,9 @@ pub(super) fn render_agent_row(
     config: &ClientShellConfig,
 ) {
     let palette = &config.palette;
-    let row_style = if row.focused {
+    let row_style = if row.selected {
+        Style::default().bg(super::sidebar::workspace_selection_background(palette))
+    } else if row.focused {
         Style::default().bg(palette.active_row_bg)
     } else {
         Style::default()

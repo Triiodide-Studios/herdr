@@ -247,6 +247,7 @@ fn surface_with_popup() -> PaneSurfaceFrame {
 
 mod agent_context_menu;
 mod agents_worktrees_notifications;
+mod chat_search;
 mod chrome_context;
 mod close_tab;
 mod copy;

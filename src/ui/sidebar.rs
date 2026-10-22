@@ -27,6 +27,10 @@ pub(crate) struct AgentPanelEntry {
     pub tokens: std::collections::HashMap<String, String>,
 }
 
+/// The fewest rows the spaces section keeps: its heading, the spacer under it, one space and its
+/// footer. It can be dragged down to this, whatever the window's height.
+const MIN_WORKSPACE_SECTION_ROWS: u16 = 4;
+
 fn sidebar_section_heights(total_height: u16, split_ratio: f32) -> (u16, u16) {
     if total_height == 0 {
         return (0, 0);
@@ -39,8 +43,12 @@ fn sidebar_section_heights(total_height: u16, split_ratio: f32) -> (u16, u16) {
         );
     }
 
-    let workspace_height = ((total_height as f32) * split_ratio.clamp(0.1, 0.9)).round() as u16;
-    let workspace_height = workspace_height.clamp(3, total_height.saturating_sub(3));
+    let workspace_height = ((total_height as f32) * split_ratio.clamp(0.0, 0.9)).round() as u16;
+    let max_workspace_height = total_height.saturating_sub(3);
+    let workspace_height = workspace_height.clamp(
+        MIN_WORKSPACE_SECTION_ROWS.min(max_workspace_height),
+        max_workspace_height,
+    );
     (
         workspace_height,
         total_height.saturating_sub(workspace_height),

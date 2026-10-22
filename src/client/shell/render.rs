@@ -248,6 +248,7 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) reveal_navigation_workspace: &'a mut bool,
     pub(super) dragged_workspace_id: Option<&'a str>,
     pub(super) workspace_drop_indicator_row: Option<u16>,
+    pub(super) chat_search: &'a mut super::chat_search_box::ChatSearchState,
 }
 
 pub(super) fn render_shell(
@@ -328,6 +329,8 @@ pub(super) fn render_shell(
         hits.agent_scrollbar = Rect::default();
         hits.agent_sort_toggle = Rect::default();
         hits.new_workspace = Rect::default();
+        hits.chat_search = Rect::default();
+        hits.chat_search_clear = Rect::default();
         hits.machines.clear();
         hits.workspaces.clear();
         hits.agents.clear();
