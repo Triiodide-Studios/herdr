@@ -1,6 +1,7 @@
 # Triiodide herdr patches
 
-Stock [herdr](https://github.com/herdrdev/herdr) plus client-only changes to the sidebar. The branch
+Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (the window) and to the server (the
+`waiting` status and agent prompts). The branch
 `triiodide/agent-context-menu` sits on the upstream release tag it was built from (now `v0.9.3`).
 
 - Right-click an agent row: Pin / Unpin, Rename, Clear name (after a rename), Copy chat ID (the agent's
@@ -46,8 +47,8 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus client-only changes to the
   other platforms still type. The receiver treats the message as a teammate's, not the user's own words.
 
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
-status also changes the server, and a server only takes a new binary by restarting, which restarts every pane
-(live handoff is not available on Windows). Pins, New chat and chat search apply to the local machine only, not
+status and the agent prompts also change the server, and a server only takes a new binary by restarting, which
+restarts every pane (live handoff is not available on Windows). Pins, New chat and chat search apply to the local machine only, not
 to remote machines added with `herdr machine add`.
 
 ## Search model
