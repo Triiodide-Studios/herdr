@@ -14,6 +14,10 @@ and `agent wait --any-of blocked` plus `agent get` confirmed the runtime status.
 The agent first ended with the plain Blue/Green question, then opened `request_user_input` after the hook
 continued its turn. The existing 2026.08.26.1 manifest matched `pick_request_blocked`, `visible_blocker: true`,
 `state: blocked`; `agent get` independently confirmed blocked. No Muse picker rule change was needed.
+The exported native session records the developer `runtime_hook` Stop feedback at sequence 82 and the
+`request_user_input` call at sequence 111; those exact events are in `muse-stop-feedback.json`.
+Build the scoped adapter before repeating the script: `go build -o bin/herdr-luna-question-parity.exe .`
+from `herdr-config/plugins/luna`.
 
 The source and distribution copies retain the trust-directory, update-picker and idle-title fixes already deployed
 in 2026.10.11.1. The new version adds only the collapsed-question rule to that deployed baseline. A pending async
