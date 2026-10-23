@@ -1,0 +1,22 @@
+
+  6 optional MCP servers unavailable (ctrl+o to expand)
+
+❯ This is an isolated native Stop hook test. We need Blake to choose the caption Blue or Green for a disposable test artifact. In your first response, end with the plain question: Which caption should we use, Blue or Green? Use no tool in that first response. If a
+  Stop hook then continues your turn, follow its feedback and use your native question tool. Do not read or modify files, call MCP tools, or start other agents.
+
+◆ Which caption should we use, Blue or Green?
+
+◈ Request user input Caption — running (25s)
+
+  Which caption should we use, Blue or Green?
+
+  ⟩ 1. Blue
+    2. Green
+    3. None of the above  Optionally, add details in notes (tab).
+
+  Enter to select · ↑/↓ to move · Tab for an optional note · Esc to interrupt
+
+── Voice input (Alt+V to start) ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  muse-wonder-full-1.0 · xhigh · T:\QuestionParityProbe · bet-auto
