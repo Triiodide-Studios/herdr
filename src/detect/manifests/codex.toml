@@ -1,7 +1,7 @@
 id = "codex"
 version = "2026.10.23.1"
 min_engine_version = 3
-updated_at = "2026-10-23T18:40:00Z"
+updated_at = "2026-10-23T18:05:00Z"
 
 # Codex 0.163.0 native async question, captured in question-parity-sol on 10/23.
 # The count and answer shortcut share the live footer, sometimes on separate lines.
