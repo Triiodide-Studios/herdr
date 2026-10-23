@@ -1,0 +1,40 @@
+
+› Scratch Stop-hook proof only. No tools or edits. End this turn exactly: Awaiting Land it; local stock checking remains unavailable due SSL timeouts. Its separate approval question is open. If the Stop hook refuses, obey and ask the harmless Blue or Green native
+  question with those two options. This is no real approval or land request.
+
+
+• Awaiting Land it; local stock checking remains unavailable due SSL timeouts. Its separate approval question is open.
+
+• Blocked by hook
+  └ You are waiting on Blake: ask Blake now with request_user_input: one or two sentences, options, Cause/Fix under a land request. No question is actually open; saying a separate approval question is open does not ask him.
+
+• Scratch proof: Blue or Green?
+
+  • Blue
+  • Green
+
+• Scratch question is open: Blue or Green?
+
+  Worked for 14s • 6:47 PM
+
+• Model changed to gpt-6.1-sol high for Plan mode.
+
+
+› Scratch Stop-hook proof: do no work and end exactly: Awaiting Land it; local stock checking remains unavailable due SSL timeouts. Its separate approval question is open. If the Stop hook refuses, call blocking request_user_input (not async) for Scratch proof:
+  Blue or Green? with Blue and Green options. This is no actual land approval.
+
+
+• Awaiting Land it; local stock checking remains unavailable due SSL timeouts. Its separate approval question is open.
+
+• Blocked by hook
+  └ You are waiting on Blake: ask Blake now with request_user_input: one or two sentences, options, Cause/Fix under a land request. No question is actually open; saying a separate approval question is open does not ask him.
+
+
+  Question 1/1 (1 unanswered)
+  Scratch proof: Blue or Green?
+
+  › 1. Blue               Select Blue for this harmless scratch proof.
+    2. Green              Select Green for this harmless scratch proof.
+    3. None of the above  Optionally, add details in notes (tab)
+
+  tab to add notes | enter to submit answer | esc to interrupt

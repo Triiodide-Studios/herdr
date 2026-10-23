@@ -19,6 +19,16 @@ The exported native session records the developer `runtime_hook` Stop feedback a
 Build the scoped adapter before repeating the script: `go build -o bin/herdr-luna-question-parity.exe .`
 from `herdr-config/plugins/luna`.
 
+`codex-native-stop-picker.txt`: Codex 0.163.0, GPT-6.1-Sol, disposable named session
+`question-parity-codex-probe`, session `01a16ae9-370c-7260-b6d1-0fd471061d2a`. The globally configured native
+Stop hook initially appeared installed but inactive in `/hooks`; reviewing and trusting its exact command there
+activated it in the same running session. The agent then ended with "Awaiting Land it" and the false claim that
+a separate approval question was open. Luna refused the Stop and the agent opened the captured real Blue/Green
+`request_user_input` picker. `agent explain` reported `blocked` via `live_strong_blocker`; `ask pending` independently
+reported `pending:true, source:screen`, and a native Stop with that question open passed without a duplicate ask.
+The earlier Default-mode `request_user_input_async` call returned accepted but left no persistent visible picker
+in this CLI. The captured blocking tool was used in Plan mode. No main server restart occurred.
+
 The source and distribution copies retain the trust-directory, update-picker and idle-title fixes already deployed
 in 2026.10.11.1. The new version adds only the collapsed-question rule to that deployed baseline. A pending async
 question must outrank a concurrent working title, so its rule has higher priority than the working-title rule.
