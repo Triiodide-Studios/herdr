@@ -37,6 +37,15 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   `herdr status server --json` has `agent_status_waiting: true` once the server knows it. A server without it
   rejects such a manifest, so a rule writer checks the capability first. The variant is last in the enums, so
   saved sessions and older clients keep decoding the statuses they know.
+- A waiting floor: `herdr pane report-agent <pane> --source ID --agent LABEL --state waiting` says an agent
+  waits on something its screen cannot show (a question for the user filed through Luna's ask tool, a plain-text
+  question its rollout records, a session timer). It is not lifecycle authority and carries no session: any source
+  may report it, including for Claude and Codex panes whose native integrations are session-only, and it only ever
+  lifts a pane herdr reads idle (shown done when unseen) to `waiting` - working, blocked and unknown are never
+  overridden. The same source's `pane release-agent` drops it, and it lapses 45 s after the last report, so a
+  reporter that dies cannot hold a pane at waiting. Luna reports it for every question tab (its inbox list) and
+  for a Claude chat between fires of a recurring cron, so a tab is always working, waiting on the user (or its
+  timer), or closed - never done at rest. `PaneAgentState::Waiting` is last, like the status.
 
 - `herdr agent prompt` (and `herdr broadcast`, Luna, bet's land wake, the ledger monitors: everything that prompts an agent) sends a
   Claude Code agent a cross-session message, the channel the SendMessage tool uses (`src/claude_peer.rs`: the session's record

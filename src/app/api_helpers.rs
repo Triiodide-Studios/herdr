@@ -91,6 +91,7 @@ pub(super) fn detect_state_from_api(
         crate::api::schema::PaneAgentState::Working => crate::detect::AgentState::Working,
         crate::api::schema::PaneAgentState::Blocked => crate::detect::AgentState::Blocked,
         crate::api::schema::PaneAgentState::Unknown => crate::detect::AgentState::Unknown,
+        crate::api::schema::PaneAgentState::Waiting => crate::detect::AgentState::Waiting,
     }
 }
 

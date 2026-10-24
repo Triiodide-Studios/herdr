@@ -924,8 +924,9 @@ pub(super) fn parse_pane_agent_state(value: &str) -> std::io::Result<PaneAgentSt
         "working" => Ok(PaneAgentState::Working),
         "blocked" => Ok(PaneAgentState::Blocked),
         "unknown" => Ok(PaneAgentState::Unknown),
+        "waiting" => Ok(PaneAgentState::Waiting),
         _ => Err(std::io::Error::other(format!(
-            "invalid pane agent state: {value} (expected idle, working, blocked, or unknown)"
+            "invalid pane agent state: {value} (expected idle, working, blocked, unknown, or waiting)"
         ))),
     }
 }

@@ -1482,7 +1482,15 @@ impl AppState {
                 seq,
                 session_ref,
             } => {
-                if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
+                if state == AgentState::Waiting {
+                    // A waiting report is a floor, not lifecycle authority: it carries no session and is open to
+                    // reserved native sources and plugins alike (see TerminalState::set_waiting_floor).
+                    self.update_terminal_state(pane_id, |terminal| {
+                        terminal.set_waiting_floor(source, agent_label, seq)
+                    })
+                    .into_iter()
+                    .collect()
+                } else if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
                     self.update_terminal_state(pane_id, |terminal| {
                         terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
                     })

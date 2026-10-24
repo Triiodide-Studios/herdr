@@ -14,6 +14,19 @@ use crate::terminal::TerminalId;
 mod metadata;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
 
+/// A reported wait that lifts an idle pane to `AgentState::Waiting` (see `TerminalState::set_waiting_floor`).
+/// Not serialized: a restored pane starts without it, and its reporter re-reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WaitingFloor {
+    source: String,
+    agent_label: String,
+    reported_at: Instant,
+}
+
+/// How long a waiting floor holds without a fresher report. A live reporter refreshes well inside it; a dead one
+/// stops holding the pane at waiting without needing a release.
+const WAITING_FLOOR_TTL: Duration = Duration::from_secs(45);
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HookAuthority {
     pub source: String,
@@ -134,6 +147,7 @@ pub struct TerminalState {
     fallback_visible_blocker: bool,
     fallback_observed_at: Option<Instant>,
     pub hook_authority: Option<HookAuthority>,
+    waiting_floor: Option<WaitingFloor>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
@@ -176,6 +190,7 @@ impl TerminalState {
             fallback_visible_blocker: false,
             fallback_observed_at: None,
             hook_authority: None,
+            waiting_floor: None,
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
@@ -1819,6 +1834,40 @@ impl TerminalState {
         agent_label: &str,
         seq: Option<u64>,
     ) -> Option<TerminalStateMutation> {
+        // The reporter of a waiting floor releases the floor alone: the pane's session, name and detected agent
+        // are not its to release. A source that also holds hook authority falls through to the release below.
+        let floor_matched = self.waiting_floor.as_ref().is_some_and(|floor| {
+            floor.source == source && floor.agent_label == agent_label
+        });
+        if floor_matched {
+            let owns_authority = self.hook_authority.as_ref().is_some_and(|authority| {
+                authority.source == source && authority.agent_label == agent_label
+            });
+            if !owns_authority {
+                if !self.accept_hook_report(source, seq) {
+                    return None;
+                }
+                let now = Instant::now();
+                let previous_agent_label = self.effective_agent_label().map(str::to_string);
+                let previous_known_agent = self.effective_known_agent();
+                let previous_state = self.state;
+                let previous_presentation =
+                    self.effective_presentation_for_state_at(previous_state, now);
+                self.waiting_floor = None;
+                return Some(TerminalStateMutation {
+                    effective_state_change: self.recompute_effective_state(
+                        previous_agent_label,
+                        previous_known_agent,
+                        previous_state,
+                        previous_presentation,
+                        now,
+                    ),
+                    session_ref_changed: false,
+                    agent_released: false,
+                });
+            }
+            self.waiting_floor = None;
+        }
         if self.hook_authority.as_ref().is_some_and(|authority| {
             authority.agent_label != agent_label || authority.source != source
         }) {
@@ -1876,6 +1925,59 @@ impl TerminalState {
             ),
             session_ref_changed: previous_session != current_session,
             agent_released: !process_owns_agent,
+        })
+    }
+
+    /// A reporter (a plugin that knows what the agent waits on, which the screen cannot show: a question for the
+    /// user filed through a tool, a timer) says the pane's agent waits. The floor never becomes hook authority and
+    /// never touches the pane's session: it only lifts an otherwise idle pane to waiting in
+    /// `recompute_effective_state`, holds for `WAITING_FLOOR_TTL`, and is dropped by the same source's
+    /// release-agent. Any source may report it, including for an agent whose native integration is session-only.
+    pub fn set_waiting_floor(
+        &mut self,
+        source: String,
+        agent_label: String,
+        seq: Option<u64>,
+    ) -> Option<TerminalStateMutation> {
+        if self.detected_agent.is_some_and(|detected| {
+            crate::detect::parse_agent_label(&agent_label) != Some(detected)
+        }) {
+            return None;
+        }
+        if !self.accept_hook_report(&source, seq) {
+            return None;
+        }
+        let now = Instant::now();
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        self.waiting_floor = Some(WaitingFloor {
+            source,
+            agent_label,
+            reported_at: now,
+        });
+        Some(TerminalStateMutation {
+            effective_state_change: self.recompute_effective_state(
+                previous_agent_label,
+                previous_known_agent,
+                previous_state,
+                previous_presentation,
+                now,
+            ),
+            session_ref_changed: false,
+            agent_released: false,
+        })
+    }
+
+    fn waiting_floor_applies(&self, now: Instant) -> bool {
+        self.waiting_floor.as_ref().is_some_and(|floor| {
+            now.saturating_duration_since(floor.reported_at) < WAITING_FLOOR_TTL
+                && self
+                    .detected_agent
+                    .is_none_or(|detected| {
+                        crate::detect::parse_agent_label(&floor.agent_label) == Some(detected)
+                    })
         })
     }
 
@@ -2423,6 +2525,12 @@ impl TerminalState {
                 .map(|authority| authority.state)
                 .unwrap_or(self.fallback_state)
         };
+        // A waiting floor only ever lifts idle: working, blocked and unknown keep the state above.
+        let state = if state == AgentState::Idle && self.waiting_floor_applies(now) {
+            AgentState::Waiting
+        } else {
+            state
+        };
         let agent_label = self.effective_agent_label().map(str::to_string);
         let known_agent = self.effective_known_agent();
 
@@ -2664,6 +2772,72 @@ mod tests {
         assert_eq!(terminal.effective_agent_label(), Some("custom-agent"));
         assert_eq!(terminal.effective_known_agent(), None);
         assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn waiting_floor_lifts_idle_to_waiting_and_release_drops_it() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Codex,
+            "herdr:codex",
+            "codex",
+            crate::agent_resume::AgentSessionRef::id("thread-1").unwrap(),
+        );
+        assert_eq!(terminal.state, AgentState::Idle);
+
+        // A plugin source may floor a pane whose session a native integration owns.
+        let mutation = terminal.set_waiting_floor(
+            "plugin:triiodide.luna.lifecycle".into(),
+            "codex".into(),
+            Some(10),
+        );
+        assert!(mutation.is_some());
+        assert_eq!(terminal.state, AgentState::Waiting);
+        assert!(terminal.hook_authority.is_none(), "a floor is not hook authority");
+
+        // Working detection wins over the floor; idle detection falls back onto it.
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        assert_eq!(terminal.state, AgentState::Working);
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        assert_eq!(terminal.state, AgentState::Waiting);
+
+        // The same source's release drops only the floor: session and detected agent stay.
+        let released = terminal.release_agent_with_mutation(
+            "plugin:triiodide.luna.lifecycle",
+            "codex",
+            Some(11),
+        );
+        assert!(released.is_some());
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(terminal.detected_agent, Some(Agent::Codex));
+        assert!(terminal.persisted_agent_session.is_some());
+    }
+
+    #[test]
+    fn waiting_floor_expires_without_a_fresher_report() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_waiting_floor("plugin:test".into(), "codex".into(), Some(1));
+        assert_eq!(terminal.state, AgentState::Waiting);
+
+        terminal.waiting_floor.as_mut().unwrap().reported_at =
+            Instant::now() - WAITING_FLOOR_TTL - Duration::from_secs(1);
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn waiting_floor_rejects_another_agent_and_never_masks_blocked() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Blocked);
+        terminal.set_waiting_floor("plugin:test".into(), "codex".into(), Some(1));
+        assert_eq!(terminal.state, AgentState::Blocked);
+
+        let rejected = terminal.set_waiting_floor("plugin:test".into(), "claude".into(), Some(2));
+        assert!(rejected.is_none());
+        assert_eq!(terminal.state, AgentState::Blocked);
     }
 
     #[test]
