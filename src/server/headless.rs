@@ -280,16 +280,22 @@ fn spawn_windows_client_accept_thread(
 
             let should_quit = should_quit.clone();
             let server_event_tx = server_event_tx.clone();
-            std::thread::spawn(move || {
-                if let Err(err) = crate::server::client_transport::handle_client_handshake(
-                    stream,
-                    client_id,
-                    &server_event_tx,
-                    &should_quit,
-                ) {
-                    debug!(client_id, err = %err, "client handshake failed");
-                }
-            });
+            // A thread that cannot be started costs this client, not the listener (see the API listener in api/server.rs).
+            let spawned = std::thread::Builder::new()
+                .name("client-handshake".into())
+                .spawn(move || {
+                    if let Err(err) = crate::server::client_transport::handle_client_handshake(
+                        stream,
+                        client_id,
+                        &server_event_tx,
+                        &should_quit,
+                    ) {
+                        debug!(client_id, err = %err, "client handshake failed");
+                    }
+                });
+            if let Err(err) = spawned {
+                error!(client_id, err = %err, "could not start a thread for a client handshake; dropping the client");
+            }
         }
     });
 }

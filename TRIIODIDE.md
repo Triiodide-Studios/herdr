@@ -55,8 +55,20 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   typed to, and not in the pane the user is working in (`agent_input_busy`; whether its box holds text is not known). Windows only;
   other platforms still type. The receiver treats the message as a teammate's, not the user's own words.
 
+- A restart brings every agent tab back with the flags it ran with (BET-7529). Claude and Codex share one launch-flag
+  parser (`src/agent_resume.rs`): Codex keeps `-p`, `-m`, `-s`, `-a`, every `-c key=value` and `--no-daemon` (a bare
+  `codex resume` does not start here), recorded when a hook reports the session. A Codex or Claude process that no hook
+  reported a session for (started by hand in the shell) is read from its own command line: the session id and flags become
+  the pane's resume command, until a hook reports a session of its own or the agent exits. A Codex session without a
+  model or effort gets them from the last `turn_context` of its rollout. `[session] codex_resume_args` stands in for the
+  flags of a session.json written before they were recorded.
+- A second server never touches the live one's sockets: before it creates, restores or removes anything, `run_server`
+  exits when the client or API socket answers, fails in any way but "nobody listens" (a timeout is not stale), or has a
+  marker file of a running herdr process that started before writing it. The API and client listeners survive a handler
+  panic or a thread that cannot be started. `Launch-BET-Herdr.ps1` reads the same marker before it starts a server.
+
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
-status and the agent prompts also change the server, and a server only takes a new binary by restarting, which
+status, the agent prompts and the restore changes also change the server, and a server only takes a new binary by restarting, which
 restarts every pane (live handoff is not available on Windows). Pins, New chat and chat search apply to the local machine only, not
 to remote machines added with `herdr machine add`.
 
