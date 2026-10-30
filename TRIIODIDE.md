@@ -66,6 +66,8 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   exits when the client or API socket answers, fails in any way but "nobody listens" (a timeout is not stale), or has a
   marker file of a running herdr process that started before writing it. The API and client listeners survive a handler
   panic or a thread that cannot be started. `Launch-BET-Herdr.ps1` reads the same marker before it starts a server.
+  `triiodide-restore-proof.ps1 -Exe <herdr.exe>` proves both on a throwaway server (its own APPDATA and CODEX_HOME; only the
+  processes below that server are ever stopped).
 
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
 status, the agent prompts and the restore changes also change the server, and a server only takes a new binary by restarting, which
