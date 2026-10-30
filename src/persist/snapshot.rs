@@ -127,9 +127,29 @@ pub struct PaneAgentSessionSnapshot {
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
     /// Flags the agent process was launched with that its resume command must repeat
-    /// (`agent_resume::claude_launch_args`).
+    /// (`agent_resume::AgentLaunch::flags`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_args: Vec<String>,
+}
+
+impl SessionSnapshot {
+    /// A session.json written before Herdr recorded Codex launch flags names none for its Codex sessions, and a bare
+    /// `codex resume` does not start on a machine whose Codex needs some. The configured flags stand in for the missing ones,
+    /// and are saved with the session from then on.
+    pub fn default_codex_launch_args(&mut self, defaults: &[String]) {
+        for pane in self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.tabs.iter_mut())
+            .flat_map(|tab| tab.panes.values_mut())
+        {
+            if let Some(session) = pane.agent_session.as_mut() {
+                if session.agent == "codex" && session.launch_args.is_empty() {
+                    session.launch_args = defaults.to_vec();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1393,13 +1413,18 @@ mod tests {
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
         });
-        terminal.agent_launch_args = crate::agent_resume::claude_launch_args(&[
-            "claude".into(),
-            "--model".into(),
-            "sonnet".into(),
-            "--effort".into(),
-            "xhigh".into(),
-        ]);
+        terminal.agent_launch_args = crate::agent_resume::agent_launch(
+            crate::detect::Agent::Claude,
+            &[
+                "claude".into(),
+                "--model".into(),
+                "sonnet".into(),
+                "--effort".into(),
+                "xhigh".into(),
+            ],
+        )
+        .unwrap()
+        .flags;
 
         let json = serde_json::to_string_pretty(&capture_from_state(&state)).unwrap();
         let snapshot = parse_snapshot(&json).unwrap();
@@ -1429,6 +1454,158 @@ mod tests {
                 "sonnet",
                 "--effort",
                 "xhigh"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_launch_args_round_trip_through_session_json() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+        });
+        terminal.agent_launch_args = vec![
+            "-p".into(),
+            "lorefs".into(),
+            "-m".into(),
+            "gpt-6.1-sol".into(),
+            "-c".into(),
+            "model_reasoning_effort=max".into(),
+            "--no-daemon".into(),
+        ];
+
+        let json = serde_json::to_string_pretty(&capture_from_state(&state)).unwrap();
+        let snapshot = parse_snapshot(&json).unwrap();
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("persisted agent session should be captured");
+
+        assert_eq!(
+            crate::agent_resume::plan_with_launch_args(
+                &agent_session.source,
+                &agent_session.agent,
+                &crate::agent_resume::AgentSessionRef::id(agent_session.value.clone()).unwrap(),
+                &agent_session.launch_args,
+            )
+            .unwrap()
+            .argv,
+            vec![
+                "codex",
+                "resume",
+                "codex-session",
+                "-p",
+                "lorefs",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=max",
+                "--no-daemon",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_json_from_before_codex_flags_were_recorded_gets_the_configured_flags() {
+        let mut state = state_with_workspaces(&["old codex", "new codex", "claude"]);
+        state.ensure_test_terminals();
+        for (index, (agent, flags)) in [
+            ("codex", Vec::new()),
+            ("codex", vec!["-p".to_string(), "recorded".to_string()]),
+            ("claude", Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = state.workspaces[index].tabs[0].root_pane;
+            let terminal_id = state.workspaces[index].tabs[0].panes[&root]
+                .attached_terminal_id
+                .clone();
+            let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: format!("herdr:{agent}"),
+                agent: agent.into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(format!("{agent}-{index}"))
+                    .unwrap(),
+            });
+            terminal.agent_launch_args = flags;
+        }
+
+        let json = serde_json::to_string_pretty(&capture_from_state(&state)).unwrap();
+        let mut snapshot = parse_snapshot(&json).unwrap();
+        let defaults = vec![
+            "--no-daemon".to_string(),
+            "-p".to_string(),
+            "lorefs".to_string(),
+        ];
+        snapshot.default_codex_launch_args(&defaults);
+
+        let launch_args = |index: usize| {
+            let workspace = &snapshot.workspaces[index];
+            let tab = &workspace.tabs[0];
+            let pane = tab.panes.values().next().unwrap();
+            pane.agent_session.as_ref().unwrap().launch_args.clone()
+        };
+        assert_eq!(launch_args(0), defaults, "a Codex with no recorded flags");
+        assert_eq!(launch_args(1), vec!["-p", "recorded"], "recorded flags stay");
+        assert!(launch_args(2).is_empty(), "only Codex is given them");
+    }
+
+    #[test]
+    fn a_codex_started_by_hand_comes_back_through_session_json_with_its_flags() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_agent_process_at(crate::detect::Agent::Codex, std::time::Instant::now());
+        // `codex resume <id> --no-daemon -p lorefs -m gpt-6.1-sol` typed at the shell: no hook ever reports a session
+        let launch = crate::agent_resume::agent_launch(
+            crate::detect::Agent::Codex,
+            &[
+                "codex.exe".to_string(),
+                "resume".into(),
+                "01a189f6-0826-7b60-8e88-522e79c04a9a".into(),
+                "--no-daemon".into(),
+                "-p".into(),
+                "lorefs".into(),
+                "-m".into(),
+                "gpt-6.1-sol".into(),
+            ],
+        )
+        .unwrap();
+        assert!(state.record_detected_launch(root, &launch));
+
+        let json = serde_json::to_string_pretty(&capture_from_state(&state)).unwrap();
+        let snapshot = parse_snapshot(&json).unwrap();
+        let pane = &snapshot.workspaces[0].tabs[0].panes[&root.raw()];
+        assert!(pane.agent_session.is_none());
+        let resume = super::super::restore::saved_reported_resume(pane)
+            .expect("the hand-started agent has a resume command");
+        let plan = super::super::restore::reported_resume_from_snapshot(resume)
+            .plan(std::path::Path::new("/project"));
+        assert_eq!(plan.agent, "codex");
+        assert_eq!(
+            plan.argv,
+            vec![
+                "codex",
+                "resume",
+                "01a189f6-0826-7b60-8e88-522e79c04a9a",
+                "-p",
+                "lorefs",
+                "-m",
+                "gpt-6.1-sol",
+                "--no-daemon",
             ]
         );
     }

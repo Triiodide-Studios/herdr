@@ -196,63 +196,113 @@ pub fn session_ref_from_snapshot(
     })
 }
 
-/// Flags of a Claude Code process that a resumed session must be started with again. `claude --resume <id>` restores
-/// the conversation, and the model from its transcript, but not the effort or the permission mode: a restored pane came
-/// back at the model's default effort. Everything else on the command line (the session, the prompt, paths) is left out.
-const CLAUDE_VALUE_FLAGS: [&str; 3] = ["--model", "--effort", "--permission-mode"];
-const CLAUDE_SWITCH_FLAGS: [&str; 1] = ["--dangerously-skip-permissions"];
+//// How one agent's command line is read for the flags a resumed session must be started with again. A resume command
+/// restores the conversation, and often the model, but not the rest of how the process was launched: a restored Claude
+/// pane came back at the model's default effort, and a restored Codex pane could not start at all without `--no-daemon`.
+/// Everything else on the command line (the session, the prompt, paths) is left out.
+struct LaunchFlagSpec {
+    /// Flags with one value, as every spelling the CLI accepts and the spelling written back; the last one given wins.
+    values: &'static [(&'static [&'static str], &'static str)],
+    /// Flags with one `key=value` value that can be given again; every one is kept, in order.
+    repeated: &'static [(&'static [&'static str], &'static str)],
+    switches: &'static [&'static str],
+}
+
+const CLAUDE_FLAGS: LaunchFlagSpec = LaunchFlagSpec {
+    values: &[
+        (&["--model"], "--model"),
+        (&["--effort"], "--effort"),
+        (&["--permission-mode"], "--permission-mode"),
+    ],
+    repeated: &[],
+    switches: &["--dangerously-skip-permissions"],
+};
+
+const CODEX_FLAGS: LaunchFlagSpec = LaunchFlagSpec {
+    values: &[
+        (&["-p", "--profile"], "-p"),
+        (&["-m", "--model"], "-m"),
+        (&["-s", "--sandbox"], "-s"),
+        (&["-a", "--ask-for-approval"], "-a"),
+    ],
+    repeated: &[(&["-c", "--config"], "-c")],
+    switches: &[
+        "--no-daemon",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--approve-for-me",
+        "--search",
+    ],
+};
+
 const MAX_LAUNCH_ARG_VALUE_LEN: usize = 64;
+const MAX_REPEATED_LAUNCH_FLAGS: usize = 16;
 
 /// A value Herdr types back into a shell unquoted-safe: letters, digits and the punctuation of model names
-/// (`claude-opus-5-5`, `opus[1m]`).
+/// (`claude-opus-5-5`, `opus[1m]`) and of `-c key=value` overrides.
 fn launch_arg_value_is_safe(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_LAUNCH_ARG_VALUE_LEN
         && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'[' | b']')
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'[' | b']' | b'=')
         })
         && !value.starts_with('-')
 }
 
-/// The flags in `args` that a restored Claude session keeps, in a fixed order, as `["--model", "x", "--effort", "y"]`.
+/// The flags in `args` that a restored session keeps, in a fixed order: value flags, then repeated ones, then switches.
 /// A flag given twice keeps its last value, as the CLI does; a flag with a value that is missing or not safe to type
 /// back is dropped, never the whole list.
-fn claude_flags(args: &[String]) -> Vec<String> {
-    let mut values: Vec<Option<String>> = vec![None; CLAUDE_VALUE_FLAGS.len()];
-    let mut switches = [false; CLAUDE_SWITCH_FLAGS.len()];
+fn launch_flags(args: &[String], spec: &LaunchFlagSpec) -> Vec<String> {
+    let position = |table: &[(&[&str], &str)], name: &str| {
+        table
+            .iter()
+            .position(|(spellings, _)| spellings.contains(&name))
+    };
+    let mut values: Vec<Option<String>> = vec![None; spec.values.len()];
+    let mut repeated: Vec<String> = Vec::new();
+    let mut switches = vec![false; spec.switches.len()];
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
+        let (name, inline_value) = match arg.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+            _ => (arg, None),
+        };
+        let next = args.get(index + 1).map(String::as_str);
+        let value = inline_value.or(next);
+        let takes_next = inline_value.is_none() && next.is_some_and(|next| !next.starts_with('-'));
         let mut consumed = 1;
-        if let Some(slot) = CLAUDE_VALUE_FLAGS.iter().position(|flag| *flag == arg) {
-            let value = args.get(index + 1).map(String::as_str);
+        if let Some(slot) = position(spec.values, name) {
             values[slot] = value
                 .filter(|value| launch_arg_value_is_safe(value))
                 .map(String::from);
-            consumed = if value.is_some_and(|value| !value.starts_with('-')) {
-                2
-            } else {
-                1
-            };
-        } else if let Some(slot) = CLAUDE_VALUE_FLAGS.iter().position(|flag| {
-            arg.strip_prefix(flag)
-                .is_some_and(|rest| rest.starts_with('='))
-        }) {
-            let value = &arg[CLAUDE_VALUE_FLAGS[slot].len() + 1..];
-            values[slot] = launch_arg_value_is_safe(value).then(|| value.to_string());
-        } else if let Some(slot) = CLAUDE_SWITCH_FLAGS.iter().position(|flag| *flag == arg) {
+            consumed = if takes_next { 2 } else { 1 };
+        } else if let Some(slot) = position(spec.repeated, name) {
+            let keep = value.filter(|value| {
+                launch_arg_value_is_safe(value) && value.contains('=') && !value.starts_with('=')
+            });
+            if let Some(value) = keep {
+                if repeated.len() < 2 * MAX_REPEATED_LAUNCH_FLAGS {
+                    repeated.push(spec.repeated[slot].1.to_string());
+                    repeated.push(value.to_string());
+                }
+            }
+            consumed = if takes_next { 2 } else { 1 };
+        } else if let Some(slot) = spec.switches.iter().position(|flag| *flag == name) {
             switches[slot] = true;
         }
         index += consumed;
     }
     let mut flags = Vec::new();
-    for (flag, value) in CLAUDE_VALUE_FLAGS.iter().zip(values) {
+    for ((_, flag), value) in spec.values.iter().zip(values) {
         if let Some(value) = value {
             flags.push((*flag).to_string());
             flags.push(value);
         }
     }
-    for (flag, on) in CLAUDE_SWITCH_FLAGS.iter().zip(switches) {
+    flags.extend(repeated);
+    for (flag, on) in spec.switches.iter().zip(switches) {
         if on {
             flags.push((*flag).to_string());
         }
@@ -260,20 +310,92 @@ fn claude_flags(args: &[String]) -> Vec<String> {
     flags
 }
 
-/// The flags to keep from the command line of a running Claude Code process (`argv[0]` is the program).
-pub fn claude_launch_args(argv: &[String]) -> Vec<String> {
-    claude_flags(argv.get(1..).unwrap_or_default())
+fn claude_flags(args: &[String]) -> Vec<String> {
+    launch_flags(args, &CLAUDE_FLAGS)
 }
 
-/// The flags the Claude Code process in a pane's foreground job was started with, or `None` when the job has no Claude
-/// process whose command line could be read.
-pub fn claude_launch_args_in_job(job: &crate::platform::ForegroundJob) -> Option<Vec<String>> {
+fn codex_flags(args: &[String]) -> Vec<String> {
+    launch_flags(args, &CODEX_FLAGS)
+}
+
+/// A session id as the agents print it: a UUID. A `--resume` that names a search term, or a bare `resume --last`, has
+/// no id to restore.
+fn is_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The session a Claude Code command line resumes or starts: `--resume <id>`, `-r <id>`, `--resume=<id>`, `--session-id <id>`.
+fn claude_session_id(args: &[String]) -> Option<String> {
+    let mut found = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let value = match arg.split_once('=') {
+            Some(("--resume" | "--session-id", value)) => Some(value),
+            _ if matches!(arg, "--resume" | "-r" | "--session-id") => {
+                index += 1;
+                args.get(index).map(String::as_str)
+            }
+            _ => None,
+        };
+        if let Some(value) = value.filter(|value| is_uuid(value)) {
+            found = Some(value.to_string());
+        }
+        index += 1;
+    }
+    found
+}
+
+/// The session a Codex command line resumes: the first id after `resume`, wherever the flags sit around it.
+fn codex_session_id(args: &[String]) -> Option<String> {
+    let resume = args.iter().position(|arg| arg == "resume")?;
+    args[resume + 1..].iter().find(|arg| is_uuid(arg)).cloned()
+}
+
+/// What a running agent process was started as: the session it resumes when its command line names one, and the flags
+/// a restored session keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLaunch {
+    pub agent: crate::detect::Agent,
+    pub session_id: Option<String>,
+    pub flags: Vec<String>,
+}
+
+/// The launch of a Claude Code or Codex process from its command line (`argv[0]` is the program); other agents have none.
+pub fn agent_launch(agent: crate::detect::Agent, argv: &[String]) -> Option<AgentLaunch> {
+    let args = argv.get(1..).unwrap_or_default();
+    let (session_id, flags) = match agent {
+        crate::detect::Agent::Claude => (claude_session_id(args), claude_flags(args)),
+        crate::detect::Agent::Codex => (codex_session_id(args), codex_flags(args)),
+        _ => return None,
+    };
+    Some(AgentLaunch {
+        agent,
+        session_id,
+        flags,
+    })
+}
+
+/// The launch of the `agent` process in a pane's foreground job, or `None` when the job has no such process whose
+/// command line could be read.
+pub fn agent_launch_in_job(
+    agent: crate::detect::Agent,
+    job: &crate::platform::ForegroundJob,
+) -> Option<AgentLaunch> {
     job.processes.iter().find_map(|process| {
         let name = process.argv0.as_deref().unwrap_or(&process.name);
-        if crate::detect::identify_agent(name) != Some(crate::detect::Agent::Claude) {
+        if crate::detect::identify_agent(name) != Some(agent) {
             return None;
         }
-        process.argv.as_deref().map(claude_launch_args)
+        process
+            .argv
+            .as_deref()
+            .and_then(|argv| agent_launch(agent, argv))
     })
 }
 
@@ -282,7 +404,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
 }
 
 /// The command that resumes a session. `launch_args` are the flags the session's process was started with
-/// (`claude_launch_args`); Claude gets them again after `--resume`, other agents ignore them.
+/// (`AgentLaunch::flags`); Claude and Codex get them again, other agents ignore them.
 pub fn plan_with_launch_args(
     source: &str,
     agent: &str,
@@ -305,7 +427,9 @@ pub fn plan_with_launch_args(
             argv
         }
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
-            vec!["codex".into(), "resume".into(), session_ref.value.clone()]
+            let mut argv = vec!["codex".into(), "resume".into(), session_ref.value.clone()];
+            argv.extend(codex_flags(launch_args));
+            argv
         }
         ("herdr:copilot", "copilot", AgentSessionRefKind::Id) => {
             vec!["copilot".into(), format!("--resume={}", session_ref.value)]
@@ -411,6 +535,110 @@ pub fn plan_with_launch_args(
         argv,
         dedupe_key: dedupe_key(source, agent, session_ref),
     })
+}
+
+/// The model and reasoning effort of a Codex thread's last turn, as its rollout records them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRolloutSettings {
+    pub model: String,
+    pub effort: String,
+}
+
+const MAX_ROLLOUT_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The rollout file of a Codex thread: `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`, found newest day first.
+fn codex_rollout_path(codex_home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
+    fn newest_first(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        entries.sort();
+        entries.reverse();
+        entries
+    }
+    let suffix = format!("-{session_id}.jsonl");
+    for year in newest_first(&codex_home.join("sessions")) {
+        for month in newest_first(&year) {
+            for day in newest_first(&month) {
+                for file in newest_first(&day) {
+                    let is_rollout = file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(&suffix));
+                    if is_rollout {
+                        return Some(file);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The model and effort of the last `turn_context` in a Codex thread's rollout, which is what its next turn runs with
+/// when the resume command names neither. `None` when the thread has no rollout or no turn yet.
+pub fn codex_rollout_settings(codex_home: &Path, session_id: &str) -> Option<CodexRolloutSettings> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(codex_rollout_path(codex_home, session_id)?).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(MAX_ROLLOUT_TAIL_BYTES)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    String::from_utf8_lossy(&tail).lines().rev().find_map(|line| {
+        let turn: serde_json::Value = serde_json::from_str(line).ok()?;
+        if turn.get("type")?.as_str()? != "turn_context" {
+            return None;
+        }
+        let payload = turn.get("payload")?;
+        let model = payload.get("model")?.as_str()?;
+        let effort = payload.get("effort")?.as_str()?;
+        (launch_arg_value_is_safe(model) && launch_arg_value_is_safe(effort)).then(|| {
+            CodexRolloutSettings {
+                model: model.to_string(),
+                effort: effort.to_string(),
+            }
+        })
+    })
+}
+
+/// `plan_with_launch_args` for a restore: a Codex thread whose recorded flags name no model or no effort gets them from its
+/// rollout, so that a thread resumed from a session.json written before the flags were recorded still runs as it did.
+pub fn plan_for_restore(
+    source: &str,
+    agent: &str,
+    session_ref: &AgentSessionRef,
+    launch_args: &[String],
+    codex_home: &Path,
+) -> Option<AgentResumePlan> {
+    let mut plan = plan_with_launch_args(source, agent, session_ref, launch_args)?;
+    if agent != "codex" || session_ref.kind != AgentSessionRefKind::Id {
+        return Some(plan);
+    }
+    let has_model = plan.argv.iter().any(|arg| arg == "-m");
+    let has_effort = plan
+        .argv
+        .windows(2)
+        .any(|pair| pair[0] == "-c" && pair[1].starts_with("model_reasoning_effort="));
+    if has_model && has_effort {
+        return Some(plan);
+    }
+    if let Some(last_turn) = codex_rollout_settings(codex_home, &session_ref.value) {
+        if !has_model {
+            plan.argv.extend(["-m".into(), last_turn.model]);
+        }
+        if !has_effort {
+            plan.argv.extend([
+                "-c".into(),
+                format!("model_reasoning_effort={}", last_turn.effort),
+            ]);
+        }
+    }
+    Some(plan)
 }
 
 pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> String {
@@ -549,6 +777,12 @@ mod tests {
         list.iter().map(|arg| arg.to_string()).collect()
     }
 
+    fn claude_launch_args(argv: &[String]) -> Vec<String> {
+        agent_launch(crate::detect::Agent::Claude, argv)
+            .unwrap()
+            .flags
+    }
+
     #[test]
     fn claude_launch_args_keep_model_effort_and_permission_mode() {
         let argv = args(&[
@@ -671,12 +905,12 @@ mod tests {
             plan("herdr:claude", "claude", &session).unwrap().dedupe_key,
             "the flags do not make a second session"
         );
-        let codex = AgentSessionRef::id("codex-session").unwrap();
+        let opencode = AgentSessionRef::id("opencode-session").unwrap();
         assert_eq!(
-            plan_with_launch_args("herdr:codex", "codex", &codex, &flags)
+            plan_with_launch_args("herdr:opencode", "opencode", &opencode, &flags)
                 .unwrap()
                 .argv,
-            args(&["codex", "resume", "codex-session"])
+            args(&["opencode", "--session", "opencode-session"])
         );
         // A hand-edited list is cleaned: only the known flags with safe values get through.
         let edited = args(&[
@@ -701,6 +935,268 @@ mod tests {
                 "--dangerously-skip-permissions"
             ])
         );
+    }
+
+    // The command lines below are the ones the fleet's tabs run (bet ps, 10/30).
+    const CODEX_TAB: &[&str] = &[
+        r"C:\Users\BlakeThomas\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe",
+        "resume",
+        "01a189f6-0826-7b60-8e88-522e79c04a9a",
+        "--no-daemon",
+        "-p",
+        "lorefs",
+        "-m",
+        "gpt-6.1-sol",
+        "-c",
+        "model_reasoning_effort=max",
+        "-c",
+        "features.default_mode_request_user_input=true",
+        "-c",
+        "include_collaboration_mode_instructions=false",
+    ];
+
+    #[test]
+    fn codex_launch_keeps_the_flags_a_resume_needs_and_the_session() {
+        let launch = agent_launch(crate::detect::Agent::Codex, &args(CODEX_TAB)).unwrap();
+        assert_eq!(
+            launch.session_id.as_deref(),
+            Some("01a189f6-0826-7b60-8e88-522e79c04a9a")
+        );
+        assert_eq!(
+            launch.flags,
+            args(&[
+                "-p",
+                "lorefs",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=max",
+                "-c",
+                "features.default_mode_request_user_input=true",
+                "-c",
+                "include_collaboration_mode_instructions=false",
+                "--no-daemon",
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_launch_reads_flags_on_either_side_of_resume() {
+        // clouds-astra's tab: the flags come first and `resume <id>` last.
+        let argv = args(&[
+            "codex.exe",
+            "--no-daemon",
+            "-p",
+            "lorefs",
+            "-m",
+            "gpt-6.1-sol",
+            "-c",
+            "model_reasoning_effort=xhigh",
+            "resume",
+            "01a18ae5-96a8-7a02-a94d-ccd78285ac41",
+        ]);
+        let launch = agent_launch(crate::detect::Agent::Codex, &argv).unwrap();
+        assert_eq!(
+            launch.session_id.as_deref(),
+            Some("01a18ae5-96a8-7a02-a94d-ccd78285ac41")
+        );
+        assert_eq!(
+            launch.flags,
+            args(&[
+                "-p",
+                "lorefs",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=xhigh",
+                "--no-daemon",
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_launch_without_a_session_id_names_no_session() {
+        for argv in [
+            args(&["codex"]),
+            args(&["codex", "resume", "--last"]),
+            args(&["codex", "resume", "my thread name"]),
+            args(&["codex", "exec", "01a189f6-0826-7b60-8e88-522e79c04a9a"]),
+        ] {
+            let launch = agent_launch(crate::detect::Agent::Codex, &argv).unwrap();
+            assert_eq!(launch.session_id, None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn claude_launch_names_the_session_it_resumes_or_starts() {
+        let id = "411b5331-9af1-4abd-a344-8b4a8d217045";
+        for argv in [
+            args(&["claude", "--resume", id, "--model", "x"]),
+            args(&["claude", "-r", id]),
+            args(&["claude", "--resume=411b5331-9af1-4abd-a344-8b4a8d217045"]),
+            args(&["claude", "--model", "x", "--session-id", id]),
+        ] {
+            let launch = agent_launch(crate::detect::Agent::Claude, &argv).unwrap();
+            assert_eq!(launch.session_id.as_deref(), Some(id), "{argv:?}");
+        }
+        for argv in [
+            args(&["claude"]),
+            args(&["claude", "--resume"]),
+            args(&["claude", "--resume", "fix the build"]),
+            args(&["claude", "-c"]),
+        ] {
+            let launch = agent_launch(crate::detect::Agent::Claude, &argv).unwrap();
+            assert_eq!(launch.session_id, None, "{argv:?}");
+        }
+        assert!(agent_launch(crate::detect::Agent::Pi, &args(&["pi", "--session", "x"])).is_none());
+    }
+
+    #[test]
+    fn codex_resume_carries_its_launch_args_and_cleans_a_hand_edited_list() {
+        let session = AgentSessionRef::id("codex-session").unwrap();
+        let flags = args(&[
+            "-p",
+            "lorefs",
+            "-m",
+            "gpt-6.1-sol",
+            "-c",
+            "model_reasoning_effort=max",
+            "--no-daemon",
+        ]);
+        let resumed = plan_with_launch_args("herdr:codex", "codex", &session, &flags).unwrap();
+        assert_eq!(
+            resumed.argv,
+            [args(&["codex", "resume", "codex-session"]), flags.clone()].concat()
+        );
+        assert_eq!(
+            resumed.dedupe_key,
+            plan("herdr:codex", "codex", &session).unwrap().dedupe_key,
+            "the flags do not make a second session"
+        );
+        assert!(validate_resume_argv(&resumed.argv).is_ok());
+
+        // session.json can be edited by anyone: only the known flags with safe values get through.
+        let edited = args(&[
+            "--remote",
+            "ws://evil.test",
+            "-c",
+            "notakeyvalue",
+            "-c",
+            "x=$(calc)",
+            "-m",
+            "a b",
+            "-p",
+            "lorefs",
+            "resume",
+            "other",
+            "--no-daemon",
+        ]);
+        assert_eq!(
+            plan_with_launch_args("herdr:codex", "codex", &session, &edited)
+                .unwrap()
+                .argv,
+            args(&["codex", "resume", "codex-session", "-p", "lorefs", "--no-daemon"])
+        );
+    }
+
+    fn write_rollout(home: &Path, day: &str, session: &str, lines: &[&str]) {
+        let dir = home.join("sessions").join(day);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("rollout-2026-10-30T00-00-00-{session}.jsonl")),
+            lines.join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn temp_home(name: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("herdr-codex-home-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn codex_rollout_gives_the_model_and_effort_of_its_last_turn() {
+        let home = temp_home("rollout");
+        let session = "01a18ce6-42f2-7c01-9098-fee91706852d";
+        write_rollout(
+            &home,
+            "2026/10/30",
+            session,
+            &[
+                r#"{"type":"session_meta","payload":{"id":"x"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6-astra","effort":"high"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"agent_message"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"max"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count"}}"#,
+            ],
+        );
+        assert_eq!(
+            codex_rollout_settings(&home, session),
+            Some(CodexRolloutSettings {
+                model: "gpt-6.1-sol".into(),
+                effort: "max".into()
+            })
+        );
+        assert_eq!(codex_rollout_settings(&home, "01a18ce6-0000-7c01-9098-fee91706852d"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn codex_restore_fills_the_model_and_effort_from_the_rollout_only_where_the_launch_lacks_them() {
+        let home = temp_home("fallback");
+        let id = "01a18ce6-42f2-7c01-9098-fee91706852d";
+        write_rollout(
+            &home,
+            "2026/10/29",
+            id,
+            &[r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"max"}}"#],
+        );
+        let session = AgentSessionRef::id(id).unwrap();
+        let plan_for = |launch_args: &[&str]| {
+            plan_for_restore("herdr:codex", "codex", &session, &args(launch_args), &home)
+                .unwrap()
+                .argv
+        };
+        // nothing recorded: the rollout supplies both
+        assert_eq!(
+            plan_for(&[]),
+            args(&["codex", "resume", id, "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=max"])
+        );
+        // a recorded model and effort are the launch's own and stay
+        assert_eq!(
+            plan_for(&["-m", "gpt-6-astra", "-c", "model_reasoning_effort=xhigh", "--no-daemon"]),
+            args(&[
+                "codex", "resume", id, "-m", "gpt-6-astra", "-c", "model_reasoning_effort=xhigh",
+                "--no-daemon"
+            ])
+        );
+        // only the effort is missing
+        assert_eq!(
+            plan_for(&["-p", "lorefs", "-m", "gpt-6-astra"]),
+            args(&[
+                "codex", "resume", id, "-p", "lorefs", "-m", "gpt-6-astra", "-c",
+                "model_reasoning_effort=max"
+            ])
+        );
+        // no rollout for the session: the recorded flags alone
+        let unknown = AgentSessionRef::id("01a18ce6-0000-7c01-9098-fee91706852d").unwrap();
+        assert_eq!(
+            plan_for_restore("herdr:codex", "codex", &unknown, &args(&["--no-daemon"]), &home)
+                .unwrap()
+                .argv,
+            args(&["codex", "resume", "01a18ce6-0000-7c01-9098-fee91706852d", "--no-daemon"])
+        );
+        // other agents are planned as before
+        let claude = AgentSessionRef::id("s").unwrap();
+        assert_eq!(
+            plan_for_restore("herdr:claude", "claude", &claude, &args(&["--effort", "high"]), &home)
+                .unwrap()
+                .argv,
+            args(&["claude", "--resume", "s", "--effort", "high"])
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

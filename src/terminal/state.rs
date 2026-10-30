@@ -128,6 +128,9 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// The source of a resume command that Herdr read from the agent process's own command line, not from the agent.
+pub const DETECTED_RESUME_SOURCE: &str = "herdr:process";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecentAgentProcessExit {
     agent: Agent,
@@ -2089,6 +2092,36 @@ impl TerminalState {
         true
     }
 
+    /// An agent started by hand in the pane's shell (`codex resume <id> ...` typed at a prompt) reports no session, so a
+    /// restart would bring its pane back as a bare shell. Its command line names the session and the flags it was started
+    /// with: they become the pane's resume command, until a session reported by the agent's own hooks takes over.
+    pub fn record_detected_launch(&mut self, launch: &crate::agent_resume::AgentLaunch) -> bool {
+        let label = crate::detect::agent_label(launch.agent);
+        let Some(session_ref) = launch
+            .session_id
+            .clone()
+            .and_then(crate::agent_resume::AgentSessionRef::id)
+        else {
+            return false;
+        };
+        if self
+            .persisted_agent_session
+            .as_ref()
+            .is_some_and(|session| session.agent == label)
+        {
+            return false;
+        }
+        let Some(plan) = crate::agent_resume::plan_with_launch_args(
+            &format!("herdr:{label}"),
+            label,
+            &session_ref,
+            &launch.flags,
+        ) else {
+            return false;
+        };
+        self.record_reported_resume(DETECTED_RESUME_SOURCE, label, None, plan.argv)
+    }
+
     pub fn reported_resume(&self) -> Option<&crate::agent_resume::ReportedAgentResume> {
         self.reported_resume.as_ref()
     }
@@ -2110,7 +2143,12 @@ impl TerminalState {
         let other_process = self
             .detected_agent
             .is_some_and(|agent| crate::detect::agent_label(agent) != resume.agent);
-        if other_authority || other_process {
+        let session_took_over = resume.source == DETECTED_RESUME_SOURCE
+            && self
+                .persisted_agent_session
+                .as_ref()
+                .is_some_and(|session| session.agent == resume.agent);
+        if other_authority || other_process || session_took_over {
             self.set_reported_resume(None);
         }
     }
@@ -6390,6 +6428,95 @@ mod tests {
         assert!(terminal.persisted_agent_session.is_none());
         assert!(!terminal.respawn_shell_on_exit);
         assert!(!terminal.finish_agent_process_acquisition());
+    }
+
+    fn hand_started_codex() -> crate::agent_resume::AgentLaunch {
+        crate::agent_resume::AgentLaunch {
+            agent: Agent::Codex,
+            session_id: Some("01a189f6-0826-7b60-8e88-522e79c04a9a".into()),
+            flags: ["-p", "lorefs", "-m", "gpt-6.1-sol", "--no-daemon"]
+                .map(String::from)
+                .to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_hand_started_agent_gets_the_resume_command_of_its_command_line() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
+
+        assert!(terminal.record_detected_launch(&hand_started_codex()));
+        let resume = terminal.reported_resume().expect("a resume command");
+        assert_eq!(resume.agent, "codex");
+        assert_eq!(
+            resume.argv,
+            [
+                "codex",
+                "resume",
+                "01a189f6-0826-7b60-8e88-522e79c04a9a",
+                "-p",
+                "lorefs",
+                "-m",
+                "gpt-6.1-sol",
+                "--no-daemon"
+            ]
+        );
+        assert!(
+            !terminal.record_detected_launch(&hand_started_codex()),
+            "the same command line is not a change"
+        );
+    }
+
+    #[test]
+    fn a_command_line_that_names_no_session_or_no_running_agent_records_nothing() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
+        let mut no_session = hand_started_codex();
+        no_session.session_id = None;
+        assert!(!terminal.record_detected_launch(&no_session));
+        assert!(terminal.reported_resume().is_none());
+
+        let mut shell_only = test_terminal();
+        assert!(!shell_only.record_detected_launch(&hand_started_codex()));
+        assert!(shell_only.reported_resume().is_none());
+    }
+
+    #[test]
+    fn a_session_the_agent_reports_replaces_the_resume_command_read_from_its_command_line() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
+        assert!(terminal.record_detected_launch(&hand_started_codex()));
+
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("another-thread").unwrap(),
+        });
+        terminal.reconcile_reported_resume();
+        assert!(
+            terminal.reported_resume().is_none(),
+            "a command line that is older than the reported session must not win at restore"
+        );
+        assert!(!terminal.record_detected_launch(&hand_started_codex()));
+    }
+
+    #[test]
+    fn the_resume_command_of_an_agent_that_exited_is_forgotten() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.set_detected_agent_process_at(Agent::Codex, now);
+        assert!(terminal.record_detected_launch(&hand_started_codex()));
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            now + Duration::from_secs(1),
+        );
+        assert!(terminal.reported_resume().is_none());
     }
 
     #[test]

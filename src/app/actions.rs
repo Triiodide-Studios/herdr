@@ -1654,6 +1654,31 @@ impl AppState {
         }
     }
 
+    /// Keeps the session and flags on the command line of the agent process in `pane_id` as the pane's resume command, when
+    /// no hook reported a session for it. True when the saved session changed.
+    pub(crate) fn record_detected_launch(
+        &mut self,
+        pane_id: PaneId,
+        launch: &crate::agent_resume::AgentLaunch,
+    ) -> bool {
+        let Some(terminal_id) = self
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return false;
+        };
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        let recorded = terminal.record_detected_launch(launch);
+        if recorded {
+            self.session_dirty = true;
+        }
+        recorded
+    }
+
     fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,

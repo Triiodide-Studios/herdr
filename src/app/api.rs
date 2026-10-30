@@ -322,8 +322,16 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        let detected_process = if let AppEvent::AgentProcessDetected { pane_id, agent, .. } = &ev {
+            Some((*pane_id, *agent))
+        } else {
+            None
+        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        if let Some((pane_id, agent)) = detected_process {
+            self.record_detected_launch(pane_id, agent);
+        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }

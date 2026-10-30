@@ -374,7 +374,8 @@ impl App {
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
             policy.restore_session && snapshot.is_none(),
         )));
-        let (workspaces, active, selected) = if let Some(snap) = snapshot {
+        let (workspaces, active, selected) = if let Some(mut snap) = snapshot {
+            snap.default_codex_launch_args(&config.session.codex_resume_args);
             let history = config
                 .experimental
                 .pane_history

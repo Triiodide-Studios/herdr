@@ -397,6 +397,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
+# Flags to resume a Codex session whose launch flags were never recorded (a session
+# saved by an older Herdr). Herdr records the flags of every Codex it sees from now on.
+# codex_resume_args = ["--no-daemon", "-p", "work"]
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

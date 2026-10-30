@@ -860,13 +860,13 @@ fn pane_restore_startup<'a>(
     }
 }
 
-fn saved_reported_resume(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentResumeSnapshot> {
+pub(super) fn saved_reported_resume(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentResumeSnapshot> {
     pane.agent_resume
         .as_ref()
         .filter(|resume| crate::agent_resume::validate_resume_argv(&resume.argv).is_ok())
 }
 
-fn reported_resume_from_snapshot(
+pub(super) fn reported_resume_from_snapshot(
     resume: &PaneAgentResumeSnapshot,
 ) -> crate::agent_resume::ReportedAgentResume {
     crate::agent_resume::ReportedAgentResume {
@@ -884,12 +884,21 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan_with_launch_args(
-        &session.source,
-        &session.agent,
-        &persisted.session_ref,
-        &session.launch_args,
-    )
+    match crate::integration::codex_dir() {
+        Ok(codex_home) => crate::agent_resume::plan_for_restore(
+            &session.source,
+            &session.agent,
+            &persisted.session_ref,
+            &session.launch_args,
+            &codex_home,
+        ),
+        Err(_) => crate::agent_resume::plan_with_launch_args(
+            &session.source,
+            &session.agent,
+            &persisted.session_ref,
+            &session.launch_args,
+        ),
+    }
 }
 
 fn persisted_agent_session_from_snapshot(

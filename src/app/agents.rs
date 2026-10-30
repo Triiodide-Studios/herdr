@@ -402,6 +402,30 @@ impl App {
         })
     }
 
+    /// A freshly detected Claude Code or Codex process is read for the session and flags on its command line: an agent
+    /// started by hand in the pane's shell reports no session of its own, and would come back as a bare shell.
+    pub(super) fn record_detected_launch(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        agent: crate::detect::Agent,
+    ) {
+        if !matches!(
+            agent,
+            crate::detect::Agent::Claude | crate::detect::Agent::Codex
+        ) {
+            return;
+        }
+        let launch = self.find_pane(pane_id).and_then(|(ws_idx, _)| {
+            let (runtime, _workspace_id) = self.lookup_runtime(ws_idx, pane_id)?;
+            live_agent_launch(runtime, agent)
+        });
+        if let Some(launch) = launch {
+            if self.state.record_detected_launch(pane_id, &launch) {
+                self.schedule_session_save();
+            }
+        }
+    }
+
     fn agent_name_conflicts(
         &self,
         name: &str,
@@ -435,11 +459,13 @@ pub(super) fn runtime_hosts_agent(
     live_runtime_agent(runtime) == Some(expected)
 }
 
-pub(super) fn live_claude_launch_args(
+/// How the `agent` process in a pane's foreground job was started, read from its command line.
+pub(super) fn live_agent_launch(
     runtime: &crate::terminal::TerminalRuntime,
-) -> Option<Vec<String>> {
+    agent: crate::detect::Agent,
+) -> Option<crate::agent_resume::AgentLaunch> {
     let job = crate::detect::foreground_job(runtime.child_pid()?)?;
-    crate::agent_resume::claude_launch_args_in_job(&job)
+    crate::agent_resume::agent_launch_in_job(agent, &job)
 }
 
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
