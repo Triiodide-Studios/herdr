@@ -301,7 +301,7 @@ fn new_msg_id() -> String {
 }
 
 /// The start time of process `pid` as a FILETIME, or None when no such process runs.
-fn process_start(pid: u32) -> Option<u64> {
+pub(crate) fn process_start(pid: u32) -> Option<u64> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,

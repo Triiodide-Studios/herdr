@@ -26,6 +26,15 @@ pub fn run_server() -> io::Result<()> {
         return run_handoff_import_server(&socket_path, token);
     }
 
+    // Before anything is created, restored or removed: a second server must leave the live one's sockets and panes alone.
+    if let Some(owner) = running_server_owner(&api::socket_path(), &client_socket_path()) {
+        warn!(%owner, "herdr server is already running; this server is not starting");
+        eprintln!("error: herdr server is already running ({owner})");
+        eprintln!("api socket: {}", api::socket_path().display());
+        eprintln!("client socket: {}", client_socket_path().display());
+        std::process::exit(1);
+    }
+
     let loaded_config = config::Config::load();
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();

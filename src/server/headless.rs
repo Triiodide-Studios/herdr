@@ -68,7 +68,7 @@ use crate::server::pane_input::{
     apply_terminal_attach_scroll, terminal_attach_mouse_position,
 };
 use crate::server::socket_paths::{
-    client_socket_path, prepare_socket_path, restrict_socket_permissions,
+    client_socket_path, prepare_socket_path, restrict_socket_permissions, running_server_owner,
 };
 use crate::server::terminal_attach::paste_payload_for_runtime;
 

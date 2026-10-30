@@ -132,20 +132,27 @@ fn start_server_inner(
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = handle_connection_with_stop(
-                        stream,
-                        &api_tx,
-                        &event_hub,
-                        &connection_running,
-                        capabilities,
-                        server_stop.as_ref(),
-                        #[cfg(unix)]
-                        ssh_agents.as_ref(),
-                    ) {
-                        warn!(err = %err, "api connection failed");
-                    }
-                });
+                // A thread that cannot be started costs this connection, not the listener: std::thread::spawn would panic here
+                // and end the accept loop, leaving a server that runs with no API socket behind its marker file.
+                let spawned = std::thread::Builder::new()
+                    .name("api-connection".into())
+                    .spawn(move || {
+                        if let Err(err) = handle_connection_with_stop(
+                            stream,
+                            &api_tx,
+                            &event_hub,
+                            &connection_running,
+                            capabilities,
+                            server_stop.as_ref(),
+                            #[cfg(unix)]
+                            ssh_agents.as_ref(),
+                        ) {
+                            warn!(err = %err, "api connection failed");
+                        }
+                    });
+                if let Err(err) = spawned {
+                    error!(err = %err, "could not start a thread for an api connection; dropping it");
+                }
             },
         );
         debug!("api server thread exiting");
@@ -173,7 +180,11 @@ fn run_accept_loop<S>(
                     info!(consecutive_errors, "api listener accept recovered");
                     consecutive_errors = 0;
                 }
-                handle(stream);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(stream)))
+                    .is_err()
+                {
+                    error!("api connection handler panicked; the listener keeps serving");
+                }
             }
             Err(err) => {
                 if !running.load(Ordering::Relaxed) {
@@ -215,6 +226,26 @@ mod accept_loop_tests {
         );
 
         assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn keeps_serving_after_a_handler_panics() {
+        let running = AtomicBool::new(true);
+        let mut handled = Vec::new();
+
+        run_accept_loop(
+            [Ok(1), Ok(2), Ok(3)],
+            &running,
+            Duration::ZERO,
+            |stream| {
+                if stream == 2 {
+                    panic!("a connection handler failed");
+                }
+                handled.push(stream);
+            },
+        );
+
+        assert_eq!(handled, vec![1, 3]);
     }
 
     #[test]
