@@ -388,8 +388,13 @@ pub fn agent_launch_in_job(
     job: &crate::platform::ForegroundJob,
 ) -> Option<AgentLaunch> {
     job.processes.iter().find_map(|process| {
-        let name = process.argv0.as_deref().unwrap_or(&process.name);
-        if crate::detect::identify_agent(name) != Some(agent) {
+        // The detector's own reading of a process, which also sees an agent behind a wrapper: `codex` typed in a shell is the npm
+        // shim, node running codex.js, and the foreground job can hold that node.exe alone.
+        let alone = crate::platform::ForegroundJob {
+            process_group_id: process.pid,
+            processes: vec![process.clone()],
+        };
+        if crate::detect::identify_agent_in_job(&alone)?.0 != agent {
             return None;
         }
         process
@@ -977,6 +982,91 @@ mod tests {
                 "include_collaboration_mode_instructions=false",
                 "--no-daemon",
             ])
+        );
+    }
+
+    fn foreground_process(pid: u32, name: &str, argv: &[&str]) -> crate::platform::ForegroundProcess {
+        crate::platform::ForegroundProcess {
+            pid,
+            name: name.into(),
+            argv0: argv.first().map(|arg| arg.to_string()),
+            argv: Some(args(argv)),
+            cmdline: Some(argv.join(" ")),
+        }
+    }
+
+    #[test]
+    fn the_codex_behind_a_node_wrapper_is_found_in_the_foreground_job() {
+        // pane 3 of the throwaway-server proof: `codex` is codex.js run by node, which starts the vendored codex.exe
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 179364,
+            processes: vec![
+                foreground_process(
+                    179364,
+                    "node.exe",
+                    &[
+                        "node",
+                        r"C:\Users\me\AppData\Roaming\npm\\node_modules\@openai\codex\bin\codex.js",
+                        "resume",
+                        "01a18ce6-1111-7c01-9098-fee917068521",
+                        "--no-daemon",
+                        "-p",
+                        "lorefs",
+                    ],
+                ),
+                foreground_process(
+                    108324,
+                    "codex.exe",
+                    &[
+                        r"C:\Users\me\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe",
+                        "resume",
+                        "01a18ce6-1111-7c01-9098-fee917068521",
+                        "--no-daemon",
+                        "-p",
+                        "lorefs",
+                    ],
+                ),
+            ],
+        };
+        let launch = agent_launch_in_job(crate::detect::Agent::Codex, &job).expect("a Codex launch");
+        assert_eq!(
+            launch.session_id.as_deref(),
+            Some("01a18ce6-1111-7c01-9098-fee917068521")
+        );
+        assert_eq!(launch.flags, args(&["-p", "lorefs", "--no-daemon"]));
+        assert!(agent_launch_in_job(crate::detect::Agent::Claude, &job).is_none());
+    }
+
+    #[test]
+    fn a_foreground_job_of_only_the_node_wrapper_still_names_the_codex_launch() {
+        // What the Windows foreground selection gave the running server for a Codex typed by hand (`codex` is the npm shim):
+        // node.exe running codex.js, with no codex.exe process in the job.
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 179364,
+            processes: vec![foreground_process(
+                179364,
+                "node.exe",
+                &[
+                    "node",
+                    r"C:\Users\me\AppData\Roaming\npm\\node_modules\@openai\codex\bin\codex.js",
+                    "resume",
+                    "01a18ce6-1111-7c01-9098-fee917068521",
+                    "--no-daemon",
+                    "-p",
+                    "lorefs",
+                    "-m",
+                    "hand-model",
+                ],
+            )],
+        };
+        let launch = agent_launch_in_job(crate::detect::Agent::Codex, &job).expect("a Codex launch");
+        assert_eq!(
+            launch.session_id.as_deref(),
+            Some("01a18ce6-1111-7c01-9098-fee917068521")
+        );
+        assert_eq!(
+            launch.flags,
+            args(&["-p", "lorefs", "-m", "hand-model", "--no-daemon"])
         );
     }
 

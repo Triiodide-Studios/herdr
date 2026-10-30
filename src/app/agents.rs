@@ -419,10 +419,24 @@ impl App {
             let (runtime, _workspace_id) = self.lookup_runtime(ws_idx, pane_id)?;
             live_agent_launch(runtime, agent)
         });
-        if let Some(launch) = launch {
-            if self.state.record_detected_launch(pane_id, &launch) {
-                self.schedule_session_save();
-            }
+        let Some(launch) = launch else {
+            tracing::debug!(
+                pane = pane_id.raw(),
+                ?agent,
+                "no command line to read for the detected agent"
+            );
+            return;
+        };
+        let recorded = self.state.record_detected_launch(pane_id, &launch);
+        tracing::info!(
+            pane = pane_id.raw(),
+            ?agent,
+            session_on_command_line = launch.session_id.is_some(),
+            recorded,
+            "read the detected agent's command line for its resume command"
+        );
+        if recorded {
+            self.schedule_session_save();
         }
     }
 
