@@ -561,6 +561,18 @@ fn should_skip_process_probe_for_lifecycle_authority(
         && !foreground_group_changed(input.foreground_pgid, input.last_foreground_pgid)
 }
 
+/// How often a pane whose agent is known, and whose screen keeps changing, has its foreground process group looked at.
+#[cfg(any(windows, test))]
+const PROCESS_OBSERVE_AFTER_CONTENT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the detection tick looks at the pane's foreground process group now. On Windows each look selects the foreground job from a
+/// snapshot of every process on the machine (0.25 to 0.6 s of CPU on the 3,000-process workstation, shared by the looks within
+/// `FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL`) and then walks that snapshot for the pane, so a look is made when something may have changed and
+/// not at every tick: a pane with no agent was looked at at every 500 ms tick, and a busy agent's pane at every 300 ms one (BET-8034).
+///
+/// - A pane with no agent is looked at when its screen changed (an agent being typed in), while one may be starting (the acquisition
+///   window), and every `PROCESS_RECHECK_IDENTIFIED` as a backstop.
+/// - A pane with an agent is looked at at most once per `PROCESS_OBSERVE_AFTER_CONTENT` while its screen changes, and at the safety bound.
 #[cfg(any(windows, test))]
 fn should_observe_foreground_process_group(
     lifecycle_authority: bool,
@@ -568,14 +580,20 @@ fn should_observe_foreground_process_group(
     elapsed: std::time::Duration,
     input: ProcessProbeInput,
 ) -> bool {
+    let unidentified = input.current_agent.is_none();
     !input.has_process_probe
-        || input.current_agent.is_none()
         || input.suppressed_agent.is_some()
         || input.pending_foreground_shell_clear
         || input.pending_restore_probe
-        || content_changed
-        || (lifecycle_authority && elapsed >= PROCESS_RECHECK_IDENTIFIED)
-        || (!lifecycle_authority && input.elapsed_since_process_check >= PROCESS_RECHECK_IDENTIFIED)
+        || (unidentified
+            && (content_changed
+                || input.acquisition_age.is_some()
+                || elapsed >= PROCESS_RECHECK_IDENTIFIED))
+        || (!unidentified && content_changed && elapsed >= PROCESS_OBSERVE_AFTER_CONTENT)
+        || (!unidentified && lifecycle_authority && elapsed >= PROCESS_RECHECK_IDENTIFIED)
+        || (!unidentified
+            && !lifecycle_authority
+            && input.elapsed_since_process_check >= PROCESS_RECHECK_IDENTIFIED)
 }
 
 fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
@@ -5306,6 +5324,9 @@ mod tests {
         assert!(!observe(false, false, before_safety_bound, quiet));
         assert!(observe(false, true, before_safety_bound, quiet));
         assert!(observe(true, true, before_safety_bound, quiet));
+        // a screen that changes at every tick is looked at once a second, not at every tick
+        assert!(!observe(true, true, std::time::Duration::from_millis(300), quiet));
+        assert!(observe(true, true, PROCESS_OBSERVE_AFTER_CONTENT, quiet));
         assert!(content_due(Some(0), 1, std::time::Duration::ZERO));
         assert!(!content_due(
             None,
@@ -5348,6 +5369,39 @@ mod tests {
             },
         ] {
             assert!(observe(false, false, std::time::Duration::ZERO, immediate));
+        }
+    }
+
+    #[test]
+    fn windows_foreground_observation_of_a_pane_with_no_agent_waits_for_a_reason() {
+        let idle = process_probe_input();
+        assert!(idle.current_agent.is_none() && idle.acquisition_age.is_none());
+        let tick = std::time::Duration::from_millis(500);
+        for lifecycle in [false, true] {
+            // an idle pane is not looked at at every tick, however long since its last probe
+            let long_since_probe = ProcessProbeInput {
+                elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED * 10,
+                ..idle
+            };
+            assert!(!should_observe_foreground_process_group(lifecycle, false, tick, idle));
+            assert!(!should_observe_foreground_process_group(lifecycle, false, tick, long_since_probe));
+            // but when its screen changed, while an agent may be starting, and at the backstop
+            assert!(should_observe_foreground_process_group(lifecycle, true, std::time::Duration::ZERO, idle));
+            assert!(should_observe_foreground_process_group(
+                lifecycle,
+                false,
+                tick,
+                ProcessProbeInput {
+                    acquisition_age: Some(std::time::Duration::from_secs(1)),
+                    ..idle
+                }
+            ));
+            assert!(should_observe_foreground_process_group(
+                lifecycle,
+                false,
+                PROCESS_RECHECK_IDENTIFIED,
+                idle
+            ));
         }
     }
 

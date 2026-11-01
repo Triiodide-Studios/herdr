@@ -382,7 +382,14 @@ use windows_sys::{
 use super::{ClipboardImage, ForegroundJob, Signal};
 
 const STILL_ACTIVE: u32 = 259;
-const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
+/// A snapshot of every process takes 0.25 to 0.6 s of CPU on the 3,000-process, 50,000-thread workstation (7 MB from NtQuerySystemInformation,
+/// which Toolhelp calls and copies), and the panes' detection ticks wanted one every 250 ms, so the server spent about a core in it (BET-8034).
+/// A pane's foreground job is looked at again whenever its screen changes (`should_observe_foreground_process_group`), so a new agent shows
+/// within a few seconds.
+const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(3);
+/// The oldest snapshot a retry after a failed selection may use. A busy agent's process tree changes between a snapshot and the identity
+/// checks on it, so the retry asked for a snapshot built that moment, one for each look at each such pane.
+const FOREGROUND_RETRY_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(1);
 const FOREGROUND_SELECTION_RECHECK: Duration = Duration::from_secs(5);
 const FOREGROUND_SELECTION_CACHE_CAPACITY: usize = 1_024;
 const FOREGROUND_SELECTION_CACHE_RETENTION: Duration = Duration::from_secs(60);
@@ -1649,7 +1656,7 @@ fn fresh_foreground_processes() -> Arc<ProcessSnapshot> {
     let mut cache = FOREGROUND_PROCESS_SNAPSHOT_CACHE
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    cache.snapshot(Duration::ZERO, snapshot_processes)
+    cache.snapshot(FOREGROUND_RETRY_SNAPSHOT_MAX_AGE, snapshot_processes)
 }
 
 fn prepare_cached_foreground_selection(

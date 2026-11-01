@@ -68,6 +68,16 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   panic or a thread that cannot be started. `Launch-BET-Herdr.ps1` reads the same marker before it starts a server.
   `triiodide-restore-proof.ps1 -Exe <herdr.exe>` proves both on a throwaway server (its own APPDATA and CODEX_HOME; only the
   processes below that server are ever stopped).
+- The Windows server looks at a pane's foreground process group less often (BET-8034). Each look selects the pane's foreground
+  job from a snapshot of every process on the machine, and one snapshot costs 0.25 to 0.6 s of CPU on the 3,000-process,
+  50,000-thread workstation; the detection tick (300 to 500 ms for each pane) made a look at every tick for a pane with no
+  agent and for a busy agent's pane, and the snapshot lived 250 ms, so the server spent 1.5 to 2 cores, 95% of it in the
+  kernel, with 80 panes. Now a pane with no agent is looked at when its screen changes, while an agent may be starting,
+  and every 5 s; a pane with an agent at most once a second while its screen changes; a snapshot lives 3 s (1 s for the
+  retry after a failed selection). On throwaway servers (scratch APPDATA, 30 s windows): 60 idle panes 0.51 to 0.56 cores
+  -> 0.20, 25 panes with an agent whose tree churns 0.35 to 0.38 -> 0.12, 30 panes printing 10 lines a second 0.88 to 0.97
+  -> 0.71 (kernel 0.41 to 0.44 -> 0.24). A process-based detection shows within a few seconds of a screen change, not within
+  one. The tokio worker count is not the cost: 4, 8 and the default 48 workers used the same CPU.
 
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
 status, the agent prompts and the restore changes also change the server, and a server only takes a new binary by restarting, which
