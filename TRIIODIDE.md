@@ -77,7 +77,7 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   retry after a failed selection). On throwaway servers (scratch APPDATA, 30 s windows): 60 idle panes 0.51 to 0.56 cores
   -> 0.20, 25 panes with an agent whose tree churns 0.35 to 0.38 -> 0.12, 30 panes printing 10 lines a second 0.88 to 0.97
   -> 0.71 (kernel 0.41 to 0.44 -> 0.24). A process-based detection shows within a few seconds of a screen change, not within
-  one. The tokio worker count is not the cost: 4, 8 and the default 48 workers used the same CPU.
+  one. The tokio worker count is not the cost: 4, 8 and the default count used the same CPU.
 
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
 status, the agent prompts and the restore changes also change the server, and a server only takes a new binary by restarting, which
