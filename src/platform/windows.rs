@@ -805,6 +805,20 @@ static FOREGROUND_PROCESS_SNAPSHOT_CACHE: Mutex<ProcessSnapshotCache> =
 static FOREGROUND_SELECTION_CACHE: LazyLock<Mutex<ForegroundSelectionCache>> =
     LazyLock::new(|| Mutex::new(ForegroundSelectionCache::default()));
 
+#[derive(Debug)]
+struct CachedProcessAgentIdentity {
+    name: String,
+    command: WindowsProcessCommand,
+    identifies_agent: bool,
+    last_used: Instant,
+}
+
+const PROCESS_AGENT_IDENTITY_CACHE_CAPACITY: usize = 16_384;
+const PROCESS_AGENT_IDENTITY_CACHE_RETENTION: Duration = Duration::from_secs(60);
+static PROCESS_AGENT_IDENTITY_CACHE: LazyLock<
+    Mutex<HashMap<(u32, u64), CachedProcessAgentIdentity>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     true
 }
@@ -901,8 +915,9 @@ impl ProcessSnapshot {
             .map(|&index| &self.entries[index])
     }
 
-    fn descendant_signatures(&self, root_pid: u32) -> Vec<ProcessSignature> {
-        let mut signatures = descendant_entries(root_pid, self)
+    /// The signatures of `root_pid`'s descendants outside `selected_pid`'s subtree (see `descendant_entries_outside`).
+    fn descendant_signatures(&self, root_pid: u32, selected_pid: u32) -> Vec<ProcessSignature> {
+        let mut signatures = descendant_entries_outside(root_pid, selected_pid, self)
             .into_iter()
             .map(ProcessSignature::from_entry)
             .collect::<Vec<_>>();
@@ -1534,9 +1549,54 @@ fn select_pane_foreground_job(
     )
 }
 
+/// Whether a process is an agent, kept for the process's life: its name and command line do not change while it runs, and finding the
+/// answer again resolves the paths in its command line on disk, a file open and close on a volume every agent session uses (BET-9635).
+/// The name and command are kept with the answer and checked on a hit, so a reused pid never takes another process's answer.
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
-    crate::detect::identify_agent(&entry.name).is_some()
-        || crate::detect::identify_agent_in_job(&foreground_job_from_entry(entry)).is_some()
+    if crate::detect::identify_agent(&entry.name).is_some() {
+        return true;
+    }
+    let command = entry.command();
+    let Some(creation_time) = command.creation_time else {
+        return process_command_identifies_agent(entry);
+    };
+    let key = (entry.pid, creation_time);
+    let now = Instant::now();
+    if let Some(cached) = PROCESS_AGENT_IDENTITY_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get_mut(&key)
+        .filter(|cached| cached.name == entry.name && cached.command == *command)
+    {
+        cached.last_used = now;
+        return cached.identifies_agent;
+    }
+    let identifies_agent = process_command_identifies_agent(entry);
+    let mut cache = PROCESS_AGENT_IDENTITY_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= PROCESS_AGENT_IDENTITY_CACHE_CAPACITY {
+        cache.retain(|_, cached| {
+            now.duration_since(cached.last_used) < PROCESS_AGENT_IDENTITY_CACHE_RETENTION
+        });
+        if cache.len() >= PROCESS_AGENT_IDENTITY_CACHE_CAPACITY {
+            cache.clear();
+        }
+    }
+    cache.insert(
+        key,
+        CachedProcessAgentIdentity {
+            name: entry.name.clone(),
+            command: command.clone(),
+            identifies_agent,
+            last_used: now,
+        },
+    );
+    identifies_agent
+}
+
+fn process_command_identifies_agent(entry: &WindowsProcessEntry) -> bool {
+    crate::detect::identify_agent_in_job(&foreground_job_from_entry(entry)).is_some()
 }
 
 fn foreground_job_from_entry(entry: &WindowsProcessEntry) -> ForegroundJob {
@@ -1578,6 +1638,20 @@ fn process_is_ancestor(ancestor_pid: u32, descendant_pid: u32, snapshot: &Proces
     }
 
     false
+}
+
+/// `root_pid`'s descendants other than those under `selected_pid`. A process that starts or ends under the agent in front (its tool
+/// calls, its MCP servers) cannot change which agent is in front, so the foreground selection cache neither records nor checks it
+/// (BET-9635).
+fn descendant_entries_outside(
+    root_pid: u32,
+    selected_pid: u32,
+    snapshot: &ProcessSnapshot,
+) -> Vec<&WindowsProcessEntry> {
+    descendant_entries(root_pid, snapshot)
+        .into_iter()
+        .filter(|entry| !process_is_ancestor(selected_pid, entry.pid, snapshot))
+        .collect()
 }
 
 fn descendant_entries(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<&WindowsProcessEntry> {
@@ -1669,7 +1743,7 @@ fn prepare_cached_foreground_selection(
     }
     let shell_identity = ProcessIdentity::open(shell_pid)?;
     let selected_identity = ProcessIdentity::open(job.process_group_id)?;
-    let descendants = snapshot.descendant_signatures(shell_pid);
+    let descendants = snapshot.descendant_signatures(shell_pid, job.process_group_id);
     let descendant_identities = descendants
         .iter()
         .map(|entry| ProcessIdentity::open(entry.pid))
@@ -1742,7 +1816,8 @@ impl CachedForegroundSelection {
 impl ForegroundSelectionCache {
     fn get(&mut self, shell_pid: u32, snapshot: &ProcessSnapshot) -> Option<ForegroundJob> {
         if let Some(cached) = self.entries.get_mut(&shell_pid) {
-            let current_descendants = descendant_entries(shell_pid, snapshot);
+            let current_descendants =
+                descendant_entries_outside(shell_pid, cached.job.process_group_id, snapshot);
             let topology_matches = current_descendants.len() == cached.descendants.len()
                 && cached
                     .descendants
@@ -1789,7 +1864,7 @@ impl ForegroundSelectionCache {
         snapshot: &ProcessSnapshot,
         job: &ForegroundJob,
     ) {
-        let descendants = snapshot.descendant_signatures(shell_pid);
+        let descendants = snapshot.descendant_signatures(shell_pid, job.process_group_id);
         let descendant_identities = descendants
             .iter()
             .map(|_| ProcessIdentity::Stub {
@@ -4103,7 +4178,7 @@ mod tests {
             test_entry_with_creation_time(30, 10, "node.exe", &["node.exe", "worker.js"], Some(3)),
         ]);
         let job = super::foreground_job_from_entry(snapshot.entry(20).unwrap());
-        let descendants = snapshot.descendant_signatures(10);
+        let descendants = snapshot.descendant_signatures(10, 20);
         let descendant_identities = vec![
             super::ProcessIdentity::Stub {
                 running: true,
@@ -4147,7 +4222,7 @@ mod tests {
             10,
             &snapshot,
             &job,
-            snapshot.descendant_signatures(10),
+            snapshot.descendant_signatures(10, 20),
             vec![super::ProcessIdentity::Stub {
                 running: true,
                 creation_time: Some(2),
@@ -4539,6 +4614,137 @@ mod tests {
             name: name.to_string(),
             command,
         }
+    }
+
+    /// A Claude pane as the fleet runs it: a shell, the agent, its MCP servers and their console hosts. Each look at the pane builds a
+    /// new snapshot, as production does every few seconds. The paths in a process's command line are resolved on disk once for the
+    /// process's life, not at every look, and a tool call's short-lived children add at most their own (BET-9635).
+    #[test]
+    fn windows_foreground_selection_resolves_each_process_path_once_across_looks() {
+        let shell = 9_635_100;
+        let agent = shell + 1;
+        let mut entries = vec![
+            test_entry_with_creation_time(
+                shell,
+                1,
+                "pwsh.exe",
+                &[r"C:\PowerShell\7\pwsh.exe", "-NoLogo"],
+                Some(9_635_001),
+            ),
+            test_entry_with_creation_time(
+                agent,
+                shell,
+                "claude.exe",
+                &[r"C:\Users\t\.local\bin\claude.exe", "--resume", "s"],
+                Some(9_635_002),
+            ),
+        ];
+        for index in 0..8u32 {
+            let server = format!(r"C:\Users\t\mcp\server-{index}\dist\index.js");
+            entries.push(test_entry_with_creation_time(
+                agent + 10 + index,
+                agent,
+                "node.exe",
+                &[r"C:\nodejs\node.exe", server.as_str()],
+                Some(9_635_010 + u64::from(index)),
+            ));
+            entries.push(test_entry_with_creation_time(
+                agent + 30 + index,
+                agent + 10 + index,
+                "conhost.exe",
+                &[r"\??\C:\WINDOWS\system32\conhost.exe", "0xffffffff", "-ForceV1"],
+                Some(9_635_030 + u64::from(index)),
+            ));
+        }
+        entries.push(test_entry_with_creation_time(
+            agent + 50,
+            agent,
+            "pwsh.exe",
+            &[r"C:\PowerShell\7\pwsh.exe", "-File", r"C:\Users\t\mcp\ps\server.ps1"],
+            Some(9_635_050),
+        ));
+
+        let look = |entries: &[super::WindowsProcessEntry]| {
+            super::select_pane_foreground_job_from_snapshot_uncached(
+                shell,
+                &super::ProcessSnapshot::new(entries.to_vec()),
+            )
+            .map(|job| job.process_group_id)
+        };
+        let before = crate::detect::canonicalize_calls_for_test();
+        assert_eq!(look(&entries), Some(agent));
+        let first_look = crate::detect::canonicalize_calls_for_test() - before;
+        for _ in 0..9 {
+            assert_eq!(look(&entries), Some(agent));
+        }
+        assert_eq!(
+            crate::detect::canonicalize_calls_for_test() - before,
+            first_look,
+            "later looks resolved again paths of processes the first look had resolved"
+        );
+
+        // A tool call: the agent starts a shell that runs git, then both exit.
+        let mut tool_call = entries.clone();
+        tool_call.push(test_entry_with_creation_time(
+            agent + 60,
+            agent,
+            "bash.exe",
+            &[r"C:\Git\usr\bin\bash.exe", "-c", "git status"],
+            Some(9_635_060),
+        ));
+        tool_call.push(test_entry_with_creation_time(
+            agent + 61,
+            agent + 60,
+            "git.exe",
+            &[r"C:\Git\cmd\git.exe", "status"],
+            Some(9_635_061),
+        ));
+        let before_tool_call = crate::detect::canonicalize_calls_for_test();
+        assert_eq!(look(&tool_call), Some(agent));
+        let tool_call_children = crate::detect::canonicalize_calls_for_test() - before_tool_call;
+        assert_eq!(look(&tool_call), Some(agent));
+        assert_eq!(look(&entries), Some(agent));
+        assert_eq!(
+            crate::detect::canonicalize_calls_for_test() - before_tool_call,
+            tool_call_children,
+            "looks after the tool call resolved its children's paths again"
+        );
+    }
+
+    /// Processes that start and end under the agent in front (its tool calls, its MCP servers) cannot change which agent is in front,
+    /// so they leave the cached selection standing; a second agent beside it does not (BET-9635).
+    #[test]
+    fn windows_foreground_selection_cache_keeps_agent_through_its_own_children() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "claude.exe", &["claude.exe"]),
+            test_entry(30, 20, "node.exe", &["node.exe", "server.js"]),
+        ]);
+        let job = super::foreground_job_from_entry(snapshot.entry(20).unwrap());
+        let mut cache = super::ForegroundSelectionCache::default();
+        cache.remember_for_test(10, &snapshot, &job);
+
+        let tool_call = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "claude.exe", &["claude.exe"]),
+            test_entry(30, 20, "node.exe", &["node.exe", "server.js"]),
+            test_entry(40, 20, "bash.exe", &["bash.exe", "-c", "git status"]),
+            test_entry(41, 40, "git.exe", &["git.exe", "status"]),
+        ]);
+        assert_eq!(cache.get(10, &tool_call), Some(job.clone()));
+
+        let server_gone = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "claude.exe", &["claude.exe"]),
+        ]);
+        assert_eq!(cache.get(10, &server_gone), Some(job.clone()));
+
+        let second_agent = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "claude.exe", &["claude.exe"]),
+            test_entry(50, 10, "codex.exe", &["codex.exe"]),
+        ]);
+        assert_eq!(cache.get(10, &second_agent), None);
     }
 
     #[test]

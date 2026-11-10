@@ -623,7 +623,13 @@ fn agent_name_from_path_token(token: &str) -> Option<String> {
 
     agent_name_from_basename(path_basename(trimmed))
         .or_else(|| agent_name_from_known_package_path(trimmed))
-        .or_else(|| resolved_agent_name_from_path_token(trimmed))
+        .or_else(|| {
+            // A runtime or shell is named by its own basename: resolving its path on disk cannot name an agent, and every resolution
+            // opens and closes the file (BET-9635).
+            (!is_generic_runtime_or_shell(trimmed))
+                .then(|| resolved_agent_name_from_path_token(trimmed))
+                .flatten()
+        })
 }
 
 fn agent_name_from_known_package_path(path: &str) -> Option<String> {
@@ -807,9 +813,22 @@ fn resolved_agent_name_from_path_token(token: &str) -> Option<String> {
         return None;
     }
 
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let resolved = std::fs::canonicalize(path).ok()?;
     let basename = resolved.file_name()?.to_str()?;
     agent_name_from_basename(basename)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many paths this thread has resolved on disk to identify an agent.
+#[cfg(test)]
+pub(crate) fn canonicalize_calls_for_test() -> usize {
+    CANONICALIZE_CALLS.with(std::cell::Cell::get)
 }
 
 fn agent_name_from_basename(basename: &str) -> Option<String> {
@@ -1780,6 +1799,22 @@ mod tests {
     #[test]
     fn cmdline_argv0_agent_name_requires_exact_agent_basename() {
         assert_eq!(cmdline_argv0_agent_name("/tmp/my-codex-helper"), None);
+    }
+
+    /// A runtime or shell is named by its basename; its path is not resolved on disk (BET-9635).
+    #[test]
+    fn runtime_and_shell_paths_are_not_resolved_on_disk() {
+        let before = canonicalize_calls_for_test();
+        for cmdline in [
+            r"C:\nodejs\node.exe C:\mcp\server.js",
+            r"C:\PowerShell\7\pwsh.exe -NoLogo",
+            r"C:\Git\usr\bin\bash.exe -l",
+            r"C:\Windows\System32\cmd.exe /d",
+            "/usr/bin/python3.12 -m http.server",
+        ] {
+            assert_eq!(cmdline_argv0_agent_name(cmdline), None, "{cmdline}");
+        }
+        assert_eq!(canonicalize_calls_for_test(), before);
     }
 
     #[cfg(unix)]

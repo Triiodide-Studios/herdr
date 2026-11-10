@@ -2922,13 +2922,16 @@ impl HeadlessServer {
         // pane.report_agent trigger handle_internal_event internally, which
         // bypasses drain_internal_events_with_forwarding. Headless mode disables
         // local sound playback, so sound notifications need to be forwarded here.
+        // A request that only reads changes no pane's state, so it skips the comparison (BET-9635).
         let toast_before = self.app.state.toast.clone();
         let pane_states_before: Vec<(
             usize,
             crate::layout::PaneId,
             crate::detect::AgentState,
             Option<String>,
-        )> = {
+        )> = if api::request_reads_only(&msg.request) {
+            Vec::new()
+        } else {
             let terminals = &self.app.state.terminals;
             self.app
                 .state
