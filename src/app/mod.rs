@@ -135,6 +135,9 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
+    /// The agents pinned in the local client's sidebar (public pane ids), read when a restore leaves resumes waiting: they
+    /// resume first.
+    pinned_agent_panes: std::collections::HashSet<String>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -408,6 +411,14 @@ impl App {
         } else {
             (Vec::new(), None, 0)
         };
+        let pinned_agent_panes = if restored_terminals
+            .values()
+            .any(|terminal| terminal.pending_agent_resume_plan.is_some())
+        {
+            crate::client::pinned_agent_panes(&crate::server::socket_paths::client_socket_path())
+        } else {
+            std::collections::HashSet::new()
+        };
 
         let agent_panel_sort = agent_panel_sort_from_config(config.ui.agent_panel_sort);
 
@@ -601,6 +612,7 @@ impl App {
                 config.session.startup_per_agent_delay_ms.into(),
             ),
             next_agent_resume_at: None,
+            pinned_agent_panes,
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,

@@ -111,6 +111,10 @@ pub struct PaneSnapshot {
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// The agent's state when the session was saved: a restore resumes the agents that were working, waiting or blocked
+    /// before the idle ones (`App::pending_agent_resume_candidates`). Not part of the layout (`layout_fingerprint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<crate::detect::AgentState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +401,14 @@ fn capture_tab(
                     launch_args: terminal.agent_launch_args.clone(),
                 })
         });
+        // A pane whose resume still waits is idle only because it waits: it keeps the state it was restored with.
+        let agent_state = terminal.and_then(|terminal| {
+            if terminal.pending_agent_resume_plan.is_some() {
+                terminal.restored_agent_state
+            } else {
+                terminal.is_agent_terminal().then_some(terminal.state)
+            }
+        });
         let agent_resume = terminal
             .and_then(|terminal| terminal.reported_resume())
             .map(|resume| PaneAgentResumeSnapshot {
@@ -414,6 +426,7 @@ fn capture_tab(
                 agent_session,
                 agent_resume,
                 launch_argv,
+                agent_state,
             },
         );
     }
@@ -435,6 +448,14 @@ pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
     value["collapsed_space_keys"] = serde_json::to_value(collapsed).ok()?;
+    // An agent's state changes while the layout does not.
+    for workspace in value["workspaces"].as_array_mut()? {
+        for tab in workspace["tabs"].as_array_mut()? {
+            for pane in tab["panes"].as_object_mut()?.values_mut() {
+                pane.as_object_mut()?.remove("agent_state");
+            }
+        }
+    }
     let bytes = serde_json::to_vec(&value).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -733,6 +754,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_state: None,
             },
         );
         panes.insert(
@@ -745,6 +767,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_state: None,
             },
         );
 
@@ -1650,6 +1673,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_state: None,
             },
         );
         panes.insert(
@@ -1664,6 +1688,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_state: None,
             },
         );
 

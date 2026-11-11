@@ -41,6 +41,7 @@ use text_editor::TextEditor;
 use word_selection::ClientWordSelection;
 
 pub(in crate::client::shell) use render::sidebar;
+pub(crate) use preferences::pinned_agent_panes;
 pub(crate) use state::*;
 #[cfg(test)]
 pub(super) use surface_patch::apply_composed_surface_patch;

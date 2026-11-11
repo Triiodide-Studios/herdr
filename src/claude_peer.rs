@@ -109,6 +109,30 @@ pub(crate) fn deliver(
     (machine.write_pipe)(&target.pipe, wire.as_bytes())
 }
 
+/// How often `deliver_when_up` looks again for a session that is not up yet.
+const SESSION_UP_POLL: Duration = Duration::from_millis(500);
+
+/// `deliver`, tried again until `until` while the session is not up: a Claude Code process being resumed writes its session
+/// record and messaging key only once it has started, and its last process's record may still name the session.
+pub(crate) fn deliver_when_up(
+    session: &str,
+    text: &str,
+    dir: &Path,
+    machine: &Machine,
+    until: Instant,
+) -> Result<(), PeerError> {
+    loop {
+        match deliver(session, text, dir, machine) {
+            Err(PeerError::NoSession(_) | PeerError::SessionGone(_) | PeerError::NoKey(_))
+                if Instant::now() < until =>
+            {
+                std::thread::sleep(SESSION_UP_POLL)
+            }
+            sent => return sent,
+        }
+    }
+}
+
 /// The session's live process and key. A session record is rewritten in place and can be read half written: the folder is read
 /// again a few times before the session is called unknown.
 pub(crate) fn find_target(

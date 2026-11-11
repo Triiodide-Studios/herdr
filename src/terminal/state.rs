@@ -180,6 +180,11 @@ pub struct TerminalState {
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// The agent's state in the saved session this pane was restored from, kept while its resume waits: it orders the resumes
+    /// (`App::pending_agent_resume_candidates`) and is what a save made before the resume starts records again.
+    pub restored_agent_state: Option<AgentState>,
+    /// When this server started the pane's agent resume: a prompt sent before the resumed session takes messages waits for it.
+    pub agent_resume_started_at: Option<Instant>,
     pub restore_error: Option<String>,
 }
 
@@ -222,6 +227,8 @@ impl TerminalState {
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
+            restored_agent_state: None,
+            agent_resume_started_at: None,
             restore_error: None,
         }
     }

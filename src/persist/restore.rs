@@ -589,6 +589,7 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.restored_agent_state = saved_pane.and_then(|pane| pane.agent_state);
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -1506,6 +1507,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_state: None,
                         },
                     )]),
                     zoomed: false,
@@ -1555,6 +1557,92 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
+    // A restore resumes the agents that were busy first (BET-9635), so the session records each agent's state. A pane whose resume
+    // still waits records the state it was restored with, not the idle state of the pane that waits, and the state is not part
+    // of the layout: an agent going from working to idle rotates no layout snapshot and orphans no pane history.
+    #[tokio::test]
+    async fn a_waiting_resume_keeps_the_agent_state_it_was_saved_with() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                launch_args: Vec::new(),
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "3c53fb2a-3fd1-4dc5-a857-064c412e0162".into(),
+                            }),
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_state: Some(crate::detect::AgentState::Waiting),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert_eq!(
+            terminal.restored_agent_state,
+            Some(crate::detect::AgentState::Waiting)
+        );
+
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let mut saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        let pane = saved.workspaces[0].tabs[0].panes.values_mut().next().unwrap();
+        assert_eq!(pane.agent_state, Some(crate::detect::AgentState::Waiting));
+        let layout = super::super::snapshot::layout_fingerprint(&saved);
+        saved.workspaces[0].tabs[0]
+            .panes
+            .values_mut()
+            .next()
+            .unwrap()
+            .agent_state = Some(crate::detect::AgentState::Idle);
+        assert_eq!(super::super::snapshot::layout_fingerprint(&saved), layout);
+    }
+
     #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
@@ -1588,6 +1676,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_state: None,
                             },
                         ),
                         (
@@ -1600,6 +1689,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_state: None,
                             },
                         ),
                     ]),
@@ -1654,6 +1744,7 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    agent_state: None,
                 },
             )
         };
@@ -1671,6 +1762,7 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            agent_state: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1824,6 +1916,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_state: None,
                         },
                     )]),
                     zoomed: false,
@@ -2130,6 +2223,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_state: None,
             },
         );
         let mut history = SessionHistorySnapshot {

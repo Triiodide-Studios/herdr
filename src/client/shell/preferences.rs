@@ -43,6 +43,14 @@ pub(super) fn path_for_local_endpoint(socket_path: &Path) -> PathBuf {
         .join(format!("local-{hash:016x}.json"))
 }
 
+/// The agents pinned in the sidebar of the local client of `socket_path`, by public pane id: a server restoring a session
+/// resumes them first.
+pub(crate) fn pinned_agent_panes(socket_path: &Path) -> std::collections::HashSet<String> {
+    load(&path_for_local_endpoint(socket_path))
+        .map(|preferences| preferences.pinned_agents.into_iter().collect())
+        .unwrap_or_default()
+}
+
 pub(super) fn load(path: &Path) -> Option<ClientChromePreferences> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()

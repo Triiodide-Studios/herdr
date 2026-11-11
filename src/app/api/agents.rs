@@ -145,7 +145,7 @@ impl App {
         };
         #[cfg(windows)]
         if terminal.effective_known_agent() == Some(crate::detect::Agent::Claude) {
-            return self.queue_claude_message(id, &params);
+            return self.queue_claude_message(id, &params, &terminal_id);
         }
         if terminal.state == crate::detect::AgentState::Blocked {
             return Err(encode_error(
@@ -235,12 +235,14 @@ impl App {
     /// the input box, among whatever its user is typing, and the Enter submits it all. A message waits in the session's own
     /// queue and reaches the agent at its next tool round, or wakes it when it is idle. The agent need not be unblocked or the
     /// foreground process of its pane: the message is not typed into anything. It is sent from a thread, as a busy pipe is
-    /// retried for seconds.
+    /// retried for seconds. An agent whose restore has not resumed it yet is resumed now, and the message waits for the resumed
+    /// session (`App::resume_agent_for_prompt`).
     #[cfg(windows)]
     fn queue_claude_message(
         &mut self,
         id: String,
         params: &AgentPromptParams,
+        terminal_id: &crate::terminal::TerminalId,
     ) -> Result<
         (
             String,
@@ -252,6 +254,10 @@ impl App {
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
+        };
+        let resuming = match self.resume_agent_for_prompt(terminal_id) {
+            Ok(resuming) => resuming,
+            Err(err) => return Err(encode_error(id, "agent_resume_failed", err)),
         };
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
@@ -272,13 +278,20 @@ impl App {
             ));
         };
         let text = params.text.clone();
+        let until = std::time::Instant::now()
+            + if resuming {
+                crate::app::agent_resume::RESUMED_SESSION_WAIT
+            } else {
+                Duration::ZERO
+            };
         let (done, completion) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let sent = crate::claude_peer::deliver(
+            let sent = crate::claude_peer::deliver_when_up(
                 &session,
                 &text,
                 &dir,
                 &crate::claude_peer::Machine::current(),
+                until,
             );
             let _ = done.send(sent.map_err(|err| std::io::Error::other(err.to_string())));
         });
@@ -727,18 +740,7 @@ mod tests {
                 ));
                 std::fs::create_dir_all(&dir).unwrap();
                 if with_session {
-                    std::fs::write(
-                        dir.join("105968.json"),
-                        format!(
-                            r#"{{"pid":105968,"sessionId":"{SESSION}","messagingSocketPath":{PIPE:?},"procStart":"{STARTED}","pidDomain":"win32:test"}}"#
-                        ),
-                    )
-                    .unwrap();
-                    std::fs::write(
-                        dir.join(key_file_name(105968, PIPE)),
-                        format!(r#"{{"peerToken":"0123456789abcdef0123456789abcdef","procStartFt":{STARTED},"pidDomain":"win32:test"}}"#),
-                    )
-                    .unwrap();
+                    write_session(&dir);
                 }
                 std::env::set_var("HERDR_CLAUDE_SESSIONS_DIR", &dir);
                 *TEST_MACHINE.lock().unwrap() = Some(Machine {
@@ -748,6 +750,22 @@ mod tests {
                 SENT.lock().unwrap().clear();
                 Self { dir, _env: env }
             }
+        }
+
+        /// The session's record and key, as Claude Code writes them once it is up.
+        fn write_session(dir: &std::path::Path) {
+            std::fs::write(
+                dir.join("105968.json"),
+                format!(
+                    r#"{{"pid":105968,"sessionId":"{SESSION}","messagingSocketPath":{PIPE:?},"procStart":"{STARTED}","pidDomain":"win32:test"}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join(key_file_name(105968, PIPE)),
+                format!(r#"{{"peerToken":"0123456789abcdef0123456789abcdef","procStartFt":{STARTED},"pidDomain":"win32:test"}}"#),
+            )
+            .unwrap();
         }
 
         impl Drop for Fixture {
@@ -860,6 +878,72 @@ mod tests {
             let response = prompt(&mut app, "wake up");
             let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
             assert_eq!(error.error.code, "agent_not_ready");
+            assert!(nothing_typed(&mut rx).await);
+        }
+
+        fn root_terminal(app: &App) -> crate::terminal::TerminalId {
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone()
+        }
+
+        // A prompt to an agent whose resume still waits in the restore queue starts that resume at once, instead of failing
+        // because the session is not up (BET-9635); a resume that cannot start says why.
+        #[tokio::test]
+        async fn a_prompt_to_an_agent_whose_resume_waits_starts_the_resume() {
+            let _fixture = Fixture::new(false);
+            let (mut app, _rx) = claude_pane(b"", AgentState::Idle);
+            app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+            let terminal_id = root_terminal(&app);
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.cwd = std::env::current_dir()
+                .unwrap()
+                .join("__herdr_missing_resume_cwd__");
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "claude".into(),
+                argv: vec!["claude".into(), "--resume".into(), SESSION.into()],
+                dedupe_key: SESSION.into(),
+            });
+
+            let response = prompt(&mut app, "wake up");
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "agent_resume_failed", "{response}");
+            assert!(error.error.message.contains("Saved directory is unavailable"), "{}", error.error.message);
+            assert!(app.state.terminals[&terminal_id].pending_agent_resume_plan.is_none());
+            assert!(SENT.lock().unwrap().is_empty());
+        }
+
+        // A resumed Claude Code writes its session record and messaging key only once it is up: a prompt sent to it before
+        // then waits for them and arrives, where it used to fail with no session (BET-9635).
+        #[tokio::test]
+        async fn a_prompt_to_an_agent_being_resumed_waits_for_its_session_and_arrives() {
+            let fixture = Fixture::new(false);
+            let (mut app, mut rx) = claude_pane(b"", AgentState::Idle);
+            let terminal_id = root_terminal(&app);
+            app.state.terminals.get_mut(&terminal_id).unwrap().agent_resume_started_at =
+                Some(std::time::Instant::now());
+            let dir = fixture.dir.clone();
+            let up = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                write_session(&dir);
+            });
+
+            let response = start_deferred_agent_prompt(
+                &mut app,
+                "req",
+                AgentPromptParams {
+                    target: "reviewer".into(),
+                    text: "after the restart".into(),
+                    wait: None,
+                },
+            )
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the prompt answers once the session is up");
+            up.join().unwrap();
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert!(matches!(success.result, ResponseResult::AgentPrompted { .. }), "{response}");
+            assert_eq!(SENT.lock().unwrap().len(), 1);
             assert!(nothing_typed(&mut rx).await);
         }
     }
