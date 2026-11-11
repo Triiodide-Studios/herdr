@@ -56,8 +56,9 @@ use state::ClientState;
 use state::RetiredDirectGraphicsMatch;
 use transport::*;
 
+pub(crate) use shell::pinned_agent_panes;
 #[cfg(test)]
-pub(crate) use shell::{pinned_agent_panes, ClientShellConfig, ClientShellState};
+pub(crate) use shell::{ClientShellConfig, ClientShellState};
 pub use startup::{run_client, run_terminal_attach};
 pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
 
