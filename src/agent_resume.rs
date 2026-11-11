@@ -314,6 +314,26 @@ fn claude_flags(args: &[String]) -> Vec<String> {
     launch_flags(args, &CLAUDE_FLAGS)
 }
 
+/// The effort a resumed Opus session runs at when its recorded launch asked for xhigh or max (Blake 11/11: no Opus at extra-high).
+const OPUS_RESUME_EFFORT: &str = "medium";
+
+/// `claude_flags` for a resume command: an Opus model recorded with `--effort xhigh` or `max` comes back at `OPUS_RESUME_EFFORT`, and nothing else
+/// changes. What a running process was launched with is still recorded as it is (`agent_launch`); only the command that starts it again is clamped.
+fn claude_resume_flags(args: &[String]) -> Vec<String> {
+    let mut flags = claude_flags(args);
+    let opus = flags
+        .windows(2)
+        .any(|pair| pair[0] == "--model" && pair[1].to_ascii_lowercase().contains("opus"));
+    if opus {
+        for index in 1..flags.len() {
+            if flags[index - 1] == "--effort" && matches!(flags[index].as_str(), "xhigh" | "max") {
+                flags[index] = OPUS_RESUME_EFFORT.to_string();
+            }
+        }
+    }
+    flags
+}
+
 fn codex_flags(args: &[String]) -> Vec<String> {
     launch_flags(args, &CODEX_FLAGS)
 }
@@ -428,7 +448,7 @@ pub fn plan_with_launch_args(
                 session_ref.value.clone(),
             ];
             // The list is read back from session.json, which anyone can edit: sanitize it again.
-            argv.extend(claude_flags(launch_args));
+            argv.extend(claude_resume_flags(launch_args));
             argv
         }
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
@@ -940,6 +960,86 @@ mod tests {
                 "--dangerously-skip-permissions"
             ])
         );
+    }
+
+    #[test]
+    fn claude_resume_brings_an_opus_model_at_xhigh_or_max_down_to_medium_and_changes_nothing_else() {
+        let session = AgentSessionRef::id("claude-session").unwrap();
+        for model in ["claude-opus-5-5", "claude-opus-5-5[1m]", "opus", "opus[1m]", "CLAUDE-OPUS-5-5"] {
+            for effort in ["xhigh", "max"] {
+                let recorded = args(&[
+                    "--model",
+                    model,
+                    "--effort",
+                    effort,
+                    "--permission-mode",
+                    "auto",
+                    "--dangerously-skip-permissions",
+                ]);
+                assert_eq!(
+                    plan_with_launch_args("herdr:claude", "claude", &session, &recorded)
+                        .unwrap()
+                        .argv,
+                    args(&[
+                        "claude",
+                        "--resume",
+                        "claude-session",
+                        "--model",
+                        model,
+                        "--effort",
+                        OPUS_RESUME_EFFORT,
+                        "--permission-mode",
+                        "auto",
+                        "--dangerously-skip-permissions",
+                    ]),
+                    "{model} at {effort}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_resume_leaves_every_other_model_and_effort_as_recorded() {
+        let session = AgentSessionRef::id("claude-session").unwrap();
+        let resumed = |recorded: &[&str]| {
+            plan_with_launch_args("herdr:claude", "claude", &session, &args(recorded))
+                .unwrap()
+                .argv
+        };
+        for effort in ["low", "medium", "high"] {
+            assert_eq!(
+                resumed(&["--model", "claude-opus-5-5", "--effort", effort]),
+                args(&["claude", "--resume", "claude-session", "--model", "claude-opus-5-5", "--effort", effort])
+            );
+        }
+        for model in ["claude-sonnet-5-5", "claude-fable-5-2", "claude-haiku-5-5", "sonnet"] {
+            for effort in ["xhigh", "max"] {
+                assert_eq!(
+                    resumed(&["--model", model, "--effort", effort]),
+                    args(&["claude", "--resume", "claude-session", "--model", model, "--effort", effort]),
+                    "{model} at {effort}"
+                );
+            }
+        }
+        // No effort recorded, or none with a model: nothing to bring down.
+        assert_eq!(
+            resumed(&["--model", "claude-opus-5-5"]),
+            args(&["claude", "--resume", "claude-session", "--model", "claude-opus-5-5"])
+        );
+        assert_eq!(
+            resumed(&["--effort", "xhigh"]),
+            args(&["claude", "--resume", "claude-session", "--effort", "xhigh"])
+        );
+    }
+
+    #[test]
+    fn what_an_opus_tab_runs_at_is_still_recorded_as_it_was_launched() {
+        let launch = agent_launch(
+            crate::detect::Agent::Claude,
+            &args(&["claude", "--model", "claude-opus-5-5", "--effort", "xhigh"]),
+        )
+        .unwrap();
+        assert_eq!(launch.flags, args(&["--model", "claude-opus-5-5", "--effort", "xhigh"]));
     }
 
     // The command lines below are the ones the fleet's tabs run (bet ps, 10/30).

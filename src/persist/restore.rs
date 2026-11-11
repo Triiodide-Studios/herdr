@@ -1150,6 +1150,55 @@ mod tests {
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
     }
 
+    // A session.json written before the clamp names an Opus tab at xhigh or max (BET-9805): the restore, which reads the saved agent_session as it is,
+    // starts it again at medium and every other tab as it was recorded.
+    #[test]
+    fn restore_plan_brings_a_recorded_opus_tab_at_xhigh_or_max_back_at_medium() {
+        let saved = |model: &str, effort: &str| -> super::super::snapshot::PaneAgentSessionSnapshot {
+            serde_json::from_str(&format!(
+                r#"{{"source":"herdr:claude","agent":"claude","kind":"id","value":"claude-session","launch_args":["--model","{model}","--effort","{effort}","--permission-mode","auto"]}}"#
+            ))
+            .unwrap()
+        };
+        for effort in ["xhigh", "max"] {
+            assert_eq!(
+                restore_plan_for_snapshot(&saved("claude-opus-5-5", effort), true)
+                    .unwrap()
+                    .argv,
+                vec![
+                    "claude",
+                    "--resume",
+                    "claude-session",
+                    "--model",
+                    "claude-opus-5-5",
+                    "--effort",
+                    "medium",
+                    "--permission-mode",
+                    "auto"
+                ],
+                "opus at {effort}"
+            );
+            assert_eq!(
+                restore_plan_for_snapshot(&saved("claude-sonnet-5-5", effort), true)
+                    .unwrap()
+                    .argv,
+                vec![
+                    "claude",
+                    "--resume",
+                    "claude-session",
+                    "--model",
+                    "claude-sonnet-5-5",
+                    "--effort",
+                    effort,
+                    "--permission-mode",
+                    "auto"
+                ],
+                "sonnet at {effort}"
+            );
+        }
+        assert!(restore_plan_for_snapshot(&saved("claude-opus-5-5", "xhigh"), false).is_none());
+    }
+
     #[test]
     fn restore_plan_selection_suppresses_duplicates() {
         let pi_session_path = test_session_path("pi-session.jsonl");
