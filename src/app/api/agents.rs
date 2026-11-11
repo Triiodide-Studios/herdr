@@ -234,9 +234,10 @@ impl App {
     /// A prompt for a Claude Code agent goes to the session as a cross-session message, never as keystrokes: typed text lands in
     /// the input box, among whatever its user is typing, and the Enter submits it all. A message waits in the session's own
     /// queue and reaches the agent at its next tool round, or wakes it when it is idle. The agent need not be unblocked or the
-    /// foreground process of its pane: the message is not typed into anything. It is sent from a thread, as a busy pipe is
-    /// retried for seconds. An agent whose restore has not resumed it yet is resumed now, and the message waits for the resumed
-    /// session (`App::resume_agent_for_prompt`).
+    /// foreground process of its pane: the message is not typed into anything. It is sent from a thread, never the main loop, as
+    /// a busy pipe is retried for seconds. An agent whose restore has not resumed it yet is resumed now, and the message waits
+    /// for the resumed session (`App::resume_agent_for_prompt`) on the one thread that serves every such wait
+    /// (`claude_peer::deliver_when_up`).
     #[cfg(windows)]
     fn queue_claude_message(
         &mut self,
@@ -278,23 +279,23 @@ impl App {
             ));
         };
         let text = params.text.clone();
-        let until = std::time::Instant::now()
-            + if resuming {
-                crate::app::agent_resume::RESUMED_SESSION_WAIT
-            } else {
-                Duration::ZERO
-            };
+        let machine = crate::claude_peer::Machine::current();
         let (done, completion) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let sent = crate::claude_peer::deliver_when_up(
-                &session,
-                &text,
-                &dir,
-                &crate::claude_peer::Machine::current(),
-                until,
+        if resuming {
+            crate::claude_peer::deliver_when_up(
+                session,
+                text,
+                dir,
+                machine,
+                std::time::Instant::now() + crate::app::agent_resume::RESUMED_SESSION_WAIT,
+                done,
             );
-            let _ = done.send(sent.map_err(|err| std::io::Error::other(err.to_string())));
-        });
+        } else {
+            std::thread::spawn(move || {
+                let sent = crate::claude_peer::deliver(&session, &text, &dir, &machine);
+                let _ = done.send(sent.map_err(|err| std::io::Error::other(err.to_string())));
+            });
+        }
         Ok((id, agent, completion))
     }
 
@@ -914,37 +915,87 @@ mod tests {
             assert!(SENT.lock().unwrap().is_empty());
         }
 
-        // A resumed Claude Code writes its session record and messaging key only once it is up: a prompt sent to it before
-        // then waits for them and arrives, where it used to fail with no session (BET-9635).
-        #[tokio::test]
-        async fn a_prompt_to_an_agent_being_resumed_waits_for_its_session_and_arrives() {
-            let fixture = Fixture::new(false);
-            let (mut app, mut rx) = claude_pane(b"", AgentState::Idle);
+        fn resuming_claude_pane() -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+            let (mut app, rx) = claude_pane(b"", AgentState::Idle);
             let terminal_id = root_terminal(&app);
             app.state.terminals.get_mut(&terminal_id).unwrap().agent_resume_started_at =
                 Some(std::time::Instant::now());
-            let dir = fixture.dir.clone();
-            let up = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                write_session(&dir);
-            });
+            (app, rx)
+        }
 
-            let response = start_deferred_agent_prompt(
-                &mut app,
+        fn start_prompt(app: &mut App, text: &str) -> std::sync::mpsc::Receiver<String> {
+            start_deferred_agent_prompt(
+                app,
                 "req",
                 AgentPromptParams {
                     target: "reviewer".into(),
-                    text: "after the restart".into(),
+                    text: text.into(),
                     wait: None,
                 },
             )
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the prompt answers once the session is up");
-            up.join().unwrap();
+        }
+
+        fn prompted(response: std::sync::mpsc::Receiver<String>) {
+            let response = response
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the prompt answers once the session is up");
             let success: SuccessResponse = serde_json::from_str(&response).unwrap();
             assert!(matches!(success.result, ResponseResult::AgentPrompted { .. }), "{response}");
+        }
+
+        // A resumed Claude Code writes its session record and messaging key only once it is up: a prompt sent to it before
+        // then waits for them and arrives, where it used to fail with no session (BET-9635). The wait is off the main loop:
+        // while the prompt waits, the loop that handled it answers a pane.get.
+        #[tokio::test]
+        async fn a_prompt_to_an_agent_being_resumed_waits_for_its_session_off_the_main_loop() {
+            let fixture = Fixture::new(false);
+            let (mut app, mut rx) = resuming_claude_pane();
+            let response = start_prompt(&mut app, "after the restart");
+            std::thread::sleep(Duration::from_millis(600));
+            assert!(response.try_recv().is_err(), "the session is not up yet");
+
+            let pane_id = app.public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane).unwrap();
+            let get = app.handle_api_request(crate::api::schema::Request {
+                id: "get".into(),
+                method: crate::api::schema::Method::PaneGet(crate::api::schema::PaneTarget {
+                    pane_id,
+                }),
+            });
+            assert!(serde_json::from_str::<SuccessResponse>(&get).is_ok(), "{get}");
+            assert!(response.try_recv().is_err(), "the prompt still waits");
+
+            write_session(&fixture.dir);
+            prompted(response);
             assert_eq!(SENT.lock().unwrap().len(), 1);
             assert!(nothing_typed(&mut rx).await);
+        }
+
+        // Prompts waiting for resumed sessions share one thread, which reads the session folder once a poll however many wait:
+        // a broadcast to a restoring fleet must not start a thread and a folder scan every 500 ms per pane. A second prompt to
+        // the same agent arrives after the first.
+        #[tokio::test]
+        async fn prompts_waiting_for_a_resumed_session_share_one_waiter_and_arrive_in_order() {
+            use crate::claude_peer::{WAITER_POLLS_AND_READS, WAITER_THREADS_STARTED};
+            use std::sync::atomic::Ordering;
+            let fixture = Fixture::new(false);
+            let (mut app, _rx) = resuming_claude_pane();
+            let threads = WAITER_THREADS_STARTED.load(Ordering::Relaxed);
+            let (polls, reads) = *WAITER_POLLS_AND_READS.lock().unwrap();
+
+            let first = start_prompt(&mut app, "first");
+            let second = start_prompt(&mut app, "second");
+            std::thread::sleep(Duration::from_millis(1200));
+            write_session(&fixture.dir);
+            prompted(first);
+            prompted(second);
+
+            assert!(WAITER_THREADS_STARTED.load(Ordering::Relaxed) - threads <= 1);
+            let (polls_after, reads_after) = *WAITER_POLLS_AND_READS.lock().unwrap();
+            assert!(polls_after - polls >= 3, "{} polls", polls_after - polls);
+            assert_eq!(reads_after - reads, polls_after - polls, "one folder read a poll");
+            let sent = SENT.lock().unwrap();
+            assert_eq!(sent.len(), 2);
+            assert!(sent[0].1.contains("first") && sent[1].1.contains("second"), "{sent:?}");
         }
     }
 

@@ -109,27 +109,103 @@ pub(crate) fn deliver(
     (machine.write_pipe)(&target.pipe, wire.as_bytes())
 }
 
-/// How often `deliver_when_up` looks again for a session that is not up yet.
+/// How often the waiter (`deliver_when_up`) looks again for the sessions that are not up yet.
 const SESSION_UP_POLL: Duration = Duration::from_millis(500);
 
-/// `deliver`, tried again until `until` while the session is not up: a Claude Code process being resumed writes its session
-/// record and messaging key only once it has started, and its last process's record may still name the session.
-pub(crate) fn deliver_when_up(
-    session: &str,
-    text: &str,
-    dir: &Path,
-    machine: &Machine,
+/// A message waiting for its session to come up.
+struct Waiter {
+    dir: PathBuf,
+    session: String,
+    text: String,
     until: Instant,
-) -> Result<(), PeerError> {
+    machine: Machine,
+    done: std::sync::mpsc::Sender<io::Result<()>>,
+}
+
+/// The messages waiting for their sessions, oldest first, and whether the thread that serves them runs.
+static WAITERS: std::sync::Mutex<(Vec<Waiter>, bool)> = std::sync::Mutex::new((Vec::new(), false));
+
+#[cfg(test)]
+pub(crate) static WAITER_THREADS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Polls the waiter made, and the session folders it read in them.
+#[cfg(test)]
+pub(crate) static WAITER_POLLS_AND_READS: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
+/// Sends `text` to `session` once the session is up, and the outcome to `done`: a Claude Code process being resumed writes its
+/// session record and messaging key only once it has started, and its last process's record may still name the session. It
+/// gives up at `until`. Every waiting message is served by one thread (`serve_waiters`), which reads each session folder once
+/// a poll however many messages wait, in the order they came, so a broadcast to a restoring fleet costs one folder read every
+/// `SESSION_UP_POLL`, not one per message.
+pub(crate) fn deliver_when_up(
+    session: String,
+    text: String,
+    dir: PathBuf,
+    machine: Machine,
+    until: Instant,
+    done: std::sync::mpsc::Sender<io::Result<()>>,
+) {
+    let mut waiting = WAITERS.lock().unwrap();
+    waiting.0.push(Waiter {
+        dir,
+        session,
+        text,
+        until,
+        machine,
+        done,
+    });
+    if !waiting.1 {
+        waiting.1 = true;
+        #[cfg(test)]
+        WAITER_THREADS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::thread::Builder::new()
+            .name("herdr-claude-wait".into())
+            .spawn(serve_waiters)
+            .expect("start the thread that waits for resumed Claude sessions");
+    }
+}
+
+fn serve_waiters() {
     loop {
-        match deliver(session, text, dir, machine) {
-            Err(PeerError::NoSession(_) | PeerError::SessionGone(_) | PeerError::NoKey(_))
-                if Instant::now() < until =>
-            {
-                std::thread::sleep(SESSION_UP_POLL)
+        let batch = {
+            let mut waiting = WAITERS.lock().unwrap();
+            if waiting.0.is_empty() {
+                waiting.1 = false;
+                return;
             }
-            sent => return sent,
+            std::mem::take(&mut waiting.0)
+        };
+        let mut folders: std::collections::HashMap<PathBuf, Vec<Record>> = Default::default();
+        let mut left = Vec::new();
+        for waiter in batch {
+            let records = folders
+                .entry(waiter.dir.clone())
+                .or_insert_with(|| read_records(&waiter.dir, |_| true).0);
+            let named = records.iter().filter(|record| record.session == waiter.session);
+            let sent = live_target(&waiter.dir, &waiter.session, named, waiter.machine.process_start)
+                .and_then(|target| {
+                    let wire = wire(&target.token, &waiter.text, &new_msg_id())?;
+                    (waiter.machine.write_pipe)(&target.pipe, wire.as_bytes())
+                });
+            match sent {
+                Err(PeerError::NoSession(_) | PeerError::SessionGone(_) | PeerError::NoKey(_))
+                    if Instant::now() < waiter.until =>
+                {
+                    left.push(waiter)
+                }
+                sent => {
+                    let _ = waiter.done.send(sent.map_err(|err| io::Error::other(err.to_string())));
+                }
+            }
         }
+        #[cfg(test)]
+        {
+            let mut counts = WAITER_POLLS_AND_READS.lock().unwrap();
+            counts.0 += 1;
+            counts.1 += folders.len();
+        }
+        WAITERS.lock().unwrap().0.splice(0..0, left);
+        std::thread::sleep(SESSION_UP_POLL);
     }
 }
 
@@ -140,42 +216,51 @@ pub(crate) fn find_target(
     session: &str,
     process_start: fn(u32) -> Option<u64>,
 ) -> Result<Target, PeerError> {
-    let mut last = PeerError::NoSession(session.to_owned());
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let (records, torn) = read_records(dir, session);
-        let mut gone = None;
-        for record in records {
-            let live = process_start(record.pid);
-            if live.is_none() || record.proc_start.is_some_and(|start| Some(start) != live) {
-                gone = Some(record.pid);
-                continue;
-            }
-            return key_for(dir, &record, live);
-        }
-        match gone {
-            Some(pid) => last = PeerError::SessionGone(pid),
-            None if !torn => return Err(last),
-            None => {}
-        }
-        if gone.is_some() {
-            return Err(last);
+        let (records, torn) = read_records(dir, |id| id == session);
+        match live_target(dir, session, &records, process_start) {
+            Err(PeerError::NoSession(_)) if torn => {}
+            found => return found,
         }
     }
-    Err(last)
+    Err(PeerError::NoSession(session.to_owned()))
+}
+
+/// The key of the first of `records` (all naming `session`) whose process runs; else why none can take a message.
+fn live_target<'a>(
+    dir: &Path,
+    session: &str,
+    records: impl IntoIterator<Item = &'a Record>,
+    process_start: fn(u32) -> Option<u64>,
+) -> Result<Target, PeerError> {
+    let mut gone = None;
+    for record in records {
+        let live = process_start(record.pid);
+        if live.is_none() || record.proc_start.is_some_and(|start| Some(start) != live) {
+            gone = Some(record.pid);
+            continue;
+        }
+        return key_for(dir, record, live);
+    }
+    Err(match gone {
+        Some(pid) => PeerError::SessionGone(pid),
+        None => PeerError::NoSession(session.to_owned()),
+    })
 }
 
 struct Record {
+    session: String,
     pid: u32,
     pipe: String,
     proc_start: Option<u64>,
     pid_domain: Option<String>,
 }
 
-/// The records that name `session`, and whether some record could not be read (it may be one being rewritten).
-fn read_records(dir: &Path, session: &str) -> (Vec<Record>, bool) {
+/// The records of the sessions `wanted` takes, and whether some record could not be read (it may be one being rewritten).
+fn read_records(dir: &Path, wanted: impl Fn(&str) -> bool) -> (Vec<Record>, bool) {
     let mut out = Vec::new();
     let mut torn = false;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -194,9 +279,9 @@ fn read_records(dir: &Path, session: &str) -> (Vec<Record>, bool) {
             torn = true;
             continue;
         };
-        if value["sessionId"].as_str() != Some(session) {
+        let Some(session) = value["sessionId"].as_str().filter(|id| wanted(id)) else {
             continue;
-        }
+        };
         let (Some(pid), Some(pipe)) = (
             value["pid"].as_u64(),
             value["messagingSocketPath"].as_str(),
@@ -204,6 +289,7 @@ fn read_records(dir: &Path, session: &str) -> (Vec<Record>, bool) {
             continue;
         };
         out.push(Record {
+            session: session.to_owned(),
             pid: pid as u32,
             pipe: pipe.to_owned(),
             proc_start: value["procStart"].as_str().and_then(|s| s.parse().ok()),
