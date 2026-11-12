@@ -2118,11 +2118,17 @@ impl TerminalState {
         {
             return false;
         }
+        let launch_args = crate::agent_resume::restore_launch_args(
+            &crate::agent_resume::claude_session_records_dir(),
+            label,
+            &session_ref,
+            &launch.flags,
+        );
         let Some(plan) = crate::agent_resume::plan_with_launch_args(
             &format!("herdr:{label}"),
             label,
             &session_ref,
-            &launch.flags,
+            &launch_args,
         ) else {
             return false;
         };
