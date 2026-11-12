@@ -885,19 +885,25 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
+    let launch_args = crate::agent_resume::restore_launch_args(
+        &crate::agent_resume::claude_session_records_dir(),
+        &session.agent,
+        &persisted.session_ref,
+        &session.launch_args,
+    );
     match crate::integration::codex_dir() {
         Ok(codex_home) => crate::agent_resume::plan_for_restore(
             &session.source,
             &session.agent,
             &persisted.session_ref,
-            &session.launch_args,
+            &launch_args,
             &codex_home,
         ),
         Err(_) => crate::agent_resume::plan_with_launch_args(
             &session.source,
             &session.agent,
             &persisted.session_ref,
-            &session.launch_args,
+            &launch_args,
         ),
     }
 }
@@ -1197,6 +1203,52 @@ mod tests {
             );
         }
         assert!(restore_plan_for_snapshot(&saved("claude-opus-5-5", "xhigh"), false).is_none());
+    }
+
+    // BET-9889: the launch flags in session.json never follow a /model or /effort typed afterwards, so a tab started as Opus and moved to Fable came back
+    // as Opus at xhigh. The record of what the session last ran at (Luna's mod writes it on every change) decides the restore, through the same entry.
+    #[test]
+    fn restore_plan_follows_the_session_record_through_a_change_made_after_launch() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let state = std::env::temp_dir().join(format!("herdr-record-restore-{}", std::process::id()));
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", &state);
+        let records = crate::agent_resume::claude_session_records_dir();
+        std::fs::create_dir_all(&records).unwrap();
+
+        let session_id = "9a1d4c7e-2b53-4f08-8e6a-0c3f5d7b1e24";
+        let launched_as_opus: super::super::snapshot::PaneAgentSessionSnapshot = serde_json::from_str(&format!(
+            r#"{{"source":"herdr:claude","agent":"claude","kind":"id","value":"{session_id}","launch_args":["--model","claude-opus-5-5","--effort","xhigh"]}}"#
+        ))
+        .unwrap();
+        let resumed = |session: &super::super::snapshot::PaneAgentSessionSnapshot| {
+            restore_plan_for_snapshot(session, true).unwrap().argv[3..].to_vec()
+        };
+        let record = |text: &str| std::fs::write(records.join(format!("{session_id}.json")), text).unwrap();
+
+        // no record yet: the launch flags, with the Opus ceiling
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-opus-5-5", "--effort", "medium"]);
+        // /model Fable and /effort low in the tab: the restore starts it as that
+        record(r#"{"model":"claude-fable-5-2","effort":"low"}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-fable-5-2", "--effort", "low"]);
+        // a later change in the same tab is the one the next restore follows
+        record(r#"{"model":"claude-sonnet-5-5","effort":"xhigh"}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-sonnet-5-5", "--effort", "xhigh"]);
+        // Opus at xhigh in the record is still never started at xhigh
+        record(r#"{"model":"claude-opus-5-5","effort":"xhigh"}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-opus-5-5", "--effort", "medium"]);
+        // a record that is half written leaves the launch flags as they are
+        record(r#"{"model":"claude-fable-5-2","eff"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-opus-5-5", "--effort", "medium"]);
+        // a record whose effort is a budget gives its model, and not the effort the launch asked for another model
+        record(r#"{"model":"claude-fable-5-2","effort":8000}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-fable-5-2"]);
+
+        match previous {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

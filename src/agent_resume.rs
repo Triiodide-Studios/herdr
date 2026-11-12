@@ -334,6 +334,81 @@ fn claude_resume_flags(args: &[String]) -> Vec<String> {
     flags
 }
 
+/// Where Luna's Claude mod keeps what each Claude session last ran at, under herdr's state directory: one
+/// `<session id>.json` holding `{"model": "...", "effort": "..."}`, written on every main-loop request that moved
+/// (`/model`, `/effort`, a restore). It is the one record that follows a session through changes made after launch;
+/// the launch flags in session.json never do.
+const CLAUDE_SESSION_RECORDS: [&str; 2] = ["plugins/triiodide.luna", "effort"];
+
+pub fn claude_session_records_dir() -> std::path::PathBuf {
+    CLAUDE_SESSION_RECORDS
+        .iter()
+        .fold(crate::config::state_dir(), |dir, part| dir.join(part))
+}
+
+#[derive(Deserialize)]
+struct ClaudeSessionRecord {
+    model: String,
+    /// A level (`"medium"`), or an integer budget, which is not a flag and is left out.
+    effort: serde_json::Value,
+}
+
+/// The `--model` and `--effort` the session last ran at, when its record in `records_dir` names a model that can be
+/// typed back. The effort belongs to that model: a record whose effort is a budget or unsafe gives the model alone.
+fn claude_session_record_flags(records_dir: &Path, session_id: &str) -> Option<Vec<String>> {
+    if !is_uuid(session_id) {
+        return None;
+    }
+    let text = std::fs::read_to_string(records_dir.join(format!("{session_id}.json"))).ok()?;
+    let record: ClaudeSessionRecord = serde_json::from_str(&text).ok()?;
+    if !launch_arg_value_is_safe(&record.model) {
+        return None;
+    }
+    let mut flags = vec!["--model".to_string(), record.model];
+    if let Some(effort) = record
+        .effort
+        .as_str()
+        .filter(|effort| launch_arg_value_is_safe(effort))
+    {
+        flags.extend(["--effort".to_string(), effort.to_string()]);
+    }
+    Some(flags)
+}
+
+/// The launch flags a restore resumes a session with. A Claude session resumes at the model and effort its record
+/// says it last ran at, in place of the ones it was launched with and never together with them: a tab started as Opus
+/// and switched to Fable resumes as Fable at Fable's effort, and one moved down to medium stays there. The rest of the
+/// launch flags (permission mode, switches) stay. Another agent, or a session with no record, keeps its launch flags.
+pub fn restore_launch_args(
+    records_dir: &Path,
+    agent: &str,
+    session_ref: &AgentSessionRef,
+    launch_args: &[String],
+) -> Vec<String> {
+    if agent != "claude" || session_ref.kind != AgentSessionRefKind::Id {
+        return launch_args.to_vec();
+    }
+    let Some(record) = claude_session_record_flags(records_dir, &session_ref.value) else {
+        return launch_args.to_vec();
+    };
+    let mut args = Vec::new();
+    let mut launched = claude_flags(launch_args).into_iter();
+    while let Some(flag) = launched.next() {
+        let value = CLAUDE_FLAGS
+            .values
+            .iter()
+            .any(|(_, name)| *name == flag)
+            .then(|| launched.next())
+            .flatten();
+        if !matches!(flag.as_str(), "--model" | "--effort") {
+            args.push(flag);
+            args.extend(value);
+        }
+    }
+    args.extend(record);
+    args
+}
+
 fn codex_flags(args: &[String]) -> Vec<String> {
     launch_flags(args, &CODEX_FLAGS)
 }
@@ -1889,5 +1964,51 @@ mod tests {
             &AgentSessionRef::path(&agy_session).unwrap()
         )
         .is_none());
+    }
+
+    #[test]
+    fn a_claude_session_record_replaces_the_launch_model_and_effort_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("herdr-session-records-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "5c0e8d2a-7b41-4e96-a3f5-1d2c9b8e7f60";
+        let session = AgentSessionRef::id(id).unwrap();
+        let launched = args(&[
+            "--model",
+            "claude-opus-5-5",
+            "--effort",
+            "xhigh",
+            "--permission-mode",
+            "auto",
+            "--dangerously-skip-permissions",
+        ]);
+        let write = |text: &str| std::fs::write(dir.join(format!("{id}.json")), text).unwrap();
+        let args_for = |agent: &str, session: &AgentSessionRef| restore_launch_args(&dir, agent, session, &launched);
+
+        write(r#"{"model":"claude-fable-5-2","effort":"low"}"#);
+        assert_eq!(
+            args_for("claude", &session),
+            args(&["--permission-mode", "auto", "--dangerously-skip-permissions", "--model", "claude-fable-5-2", "--effort", "low"])
+        );
+        // the resume command puts them in its fixed order and clamps nothing for Fable
+        let plan = plan_with_launch_args("herdr:claude", "claude", &session, &args_for("claude", &session)).unwrap();
+        assert_eq!(
+            plan.argv,
+            args(&["claude", "--resume", id, "--model", "claude-fable-5-2", "--effort", "low", "--permission-mode", "auto", "--dangerously-skip-permissions"])
+        );
+
+        // a record that cannot be used leaves the launch flags alone: unsafe model, no model, not JSON, a missing file
+        for unusable in [r#"{"model":"a b","effort":"low"}"#, r#"{"effort":"low"}"#, "not json", ""] {
+            write(unusable);
+            assert_eq!(args_for("claude", &session), launched, "{unusable:?}");
+        }
+        std::fs::remove_file(dir.join(format!("{id}.json"))).unwrap();
+        assert_eq!(args_for("claude", &session), launched);
+
+        // another agent never reads a Claude record, and a session id that is not a UUID never names a file
+        write(r#"{"model":"claude-fable-5-2","effort":"low"}"#);
+        assert_eq!(args_for("codex", &session), launched);
+        let outside = AgentSessionRef::id("../../etc/passwd").unwrap();
+        assert_eq!(args_for("claude", &outside), launched);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
