@@ -2119,6 +2119,34 @@ impl PaneRuntime {
         self.preserve_processes_on_drop = true;
     }
 
+    /// `shutdown` for a pane the user or an API client closed: the PTY is closed here, and the wait for the pane's processes to exit (up to
+    /// 250 ms for each of three steps, 750 ms in all) runs on its own thread. The app loop is the one thread that serves every key, every
+    /// API request and the render, and it sat in that wait for as long as Luna's pane closes took on 11/16 (32 closes, median 866 ms,
+    /// BET-9635). Nothing that follows a plain close waits for the processes; a worktree removal waits for the exit events and keeps `shutdown`.
+    pub fn shutdown_in_background(mut self) {
+        if let Some(handle) = self.detect_handle.take() {
+            handle.abort();
+        }
+        self.compression.abort();
+        self.io.shutdown();
+        self.preserve_processes_on_drop = true;
+        let pane_id = self.pane_id;
+        let child_pid = self.child_pid.load(Ordering::Acquire);
+        let child_wait_completed = self.child_wait_completed.clone();
+        let for_thread = child_wait_completed.clone();
+        let spawned = std::thread::Builder::new()
+            .name("herdr-pane-reap".into())
+            .spawn(move || shutdown_pane_processes(pane_id, child_pid, for_thread.as_deref()));
+        if let Err(err) = spawned {
+            warn!(
+                pane = pane_id.raw(),
+                err = %err,
+                "could not start the pane reaper thread; ending the pane's processes inline"
+            );
+            shutdown_pane_processes(pane_id, child_pid, child_wait_completed.as_deref());
+        }
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.io.duplicate_handoff_fd()
@@ -3914,6 +3942,31 @@ mod tests {
         runtime.test_process_pty_bytes(b"5 q");
         assert!(!runtime.visible_text().contains("5 q"));
         assert!(rx.try_recv().is_err(), "clear must not send child input");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shutdown_in_background_does_not_wait_for_the_panes_processes() {
+        // `shutdown` waits 250 ms after a Hangup that does nothing on Windows, and up to 500 ms more, for a child that is still running.
+        // The app loop closes panes on API requests and must not sit in that wait (BET-9635).
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
+        runtime.child_pid.store(child.id(), Ordering::Release);
+
+        let started = std::time::Instant::now();
+        runtime.shutdown_in_background();
+        let returned = started.elapsed();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            returned < std::time::Duration::from_millis(150),
+            "shutdown_in_background took {returned:?}"
+        );
     }
 
     #[tokio::test]

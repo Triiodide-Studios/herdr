@@ -1997,7 +1997,7 @@ impl App {
         if should_close_workspace {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
-            self.shutdown_detached_terminal_runtimes();
+            self.shutdown_detached_terminal_runtimes_in_background();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
                 data: EventData::PaneClosed {
@@ -2014,7 +2014,7 @@ impl App {
             });
         } else {
             self.state.remove_unattached_terminal_ids(terminal_id);
-            self.shutdown_detached_terminal_runtimes();
+            self.shutdown_detached_terminal_runtimes_in_background();
             self.schedule_session_save();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,

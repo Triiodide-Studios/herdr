@@ -21,6 +21,11 @@ impl TerminalRuntime {
         self.0.shutdown();
     }
 
+    /// `shutdown` that leaves the wait for the pane's processes to a thread of its own (see `PaneRuntime::shutdown_in_background`).
+    pub fn shutdown_in_background(self) {
+        self.0.shutdown_in_background();
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.0.duplicate_handoff_fd()

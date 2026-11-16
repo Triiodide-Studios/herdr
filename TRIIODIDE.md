@@ -78,6 +78,22 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   -> 0.20, 25 panes with an agent whose tree churns 0.35 to 0.38 -> 0.12, 30 panes printing 10 lines a second 0.88 to 0.97
   -> 0.71 (kernel 0.41 to 0.44 -> 0.24). A process-based detection shows within a few seconds of a screen change, not within
   one. The tokio worker count is not the cost: 4, 8 and the default count used the same CPU.
+- What the API served and what held the app loop (BET-9635, 11/16). The loop is one thread that serves every key, every API request
+  and the render; the monitor's probe (a `pane.get` every 3 s) saw it hold for 0.1 to 1.2 s at a time, and the log showed 5 of 28
+  such holds because it named only the requests that change the screen, only at their start and end. Three changes, each measured
+  on throwaway servers (scratch APPDATA; the deployed `restore-agents` build against this one, 60 requests or 3 closes each):
+  (1) closing a pane, tab or workspace through the API closes the PTY on the loop and leaves the wait for its processes to exit
+  (Hangup, which does nothing on Windows, then Terminate, then Kill: 250 ms each) to a thread of its own
+  (`PaneRuntime::shutdown_in_background`); a worktree removal keeps the blocking `shutdown`. A pane whose child needs 4 s to leave:
+  the loop answered nothing for 915 to 943 ms and `herdr pane close` took 1.07 to 1.10 s; now a probe sent meanwhile waits 1 ms and
+  the call takes 120 to 128 ms. The child is still alive when the waits end in both (`pane session still alive after forced shutdown`).
+  (2) A new connection's request line is polled for with a sleep that doubles from 250 us to 100 ms, not a flat 100 ms: a client that
+  writes 20 ms after it connects had its reply 71 ms after the write (60 of 60), and has it after 5.6 ms (maximum 22).
+  (3) The log says what the API served: one `api.stats` line a minute (requests by sender, the part of the request id before the
+  first `:`, and method, reads included, with the average and longest time, and the requests that kept the loop longest);
+  `api.request.slow` for a request that took 100 ms, `api.loop.held` for one that kept the loop 50 ms, and `api.backlog.drain`
+  when the internal events drained before a request took 50 ms. Not changed: pane spawn still runs on the loop (`tab.create` took
+  5.7 s once on 11/16), and the kernel resource wait that was 57% of the main thread's waits that day is not named.
 
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
 status, the agent prompts and the restore changes also change the server, and a server only takes a new binary by restarting, which

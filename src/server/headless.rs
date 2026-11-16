@@ -2915,7 +2915,13 @@ impl HeadlessServer {
                 &msg.request.method,
                 api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
             );
+        let drain_started = Instant::now();
         changed |= self.drain_all_internal_events_with_forwarding();
+        crate::logging::api_backlog_drained(
+            &msg.request.id,
+            api::api_method_name(&msg.request.method),
+            drain_started.elapsed(),
+        );
 
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like

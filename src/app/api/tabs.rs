@@ -244,7 +244,7 @@ impl App {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
             self.state.remove_plugin_pane_records(pane_ids);
-            self.shutdown_detached_terminal_runtimes();
+            self.shutdown_detached_terminal_runtimes_in_background();
             self.emit_event(EventEnvelope {
                 event: EventKind::TabClosed,
                 data: EventData::TabClosed {
@@ -274,7 +274,7 @@ impl App {
         }
         self.state.remove_plugin_pane_records(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
-        self.shutdown_detached_terminal_runtimes();
+        self.shutdown_detached_terminal_runtimes_in_background();
         self.schedule_session_save();
         self.emit_event(EventEnvelope {
             event: EventKind::TabClosed,

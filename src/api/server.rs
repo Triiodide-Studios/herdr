@@ -27,6 +27,11 @@ mod subscription_socket_tests;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// The first sleep of the poll for a new connection's request line. A Windows named pipe has no read timeout, so the line is polled for;
+/// a client writes its request a few hundred microseconds after it connects, and polling every `CONNECTION_POLL_INTERVAL` made a request
+/// whose first poll came first wait a full interval for nothing. The sleep doubles from here up to the interval, so an idle connection
+/// polls as rarely as before (BET-9635).
+const REQUEST_POLL_FIRST: Duration = Duration::from_micros(250);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -379,6 +384,7 @@ fn handle_connection_with_stop(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+    let request_started = Instant::now();
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
@@ -499,6 +505,7 @@ fn handle_connection_with_stop(
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
+            crate::logging::api_request_served(&request_id, method, request_started.elapsed());
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -737,6 +744,7 @@ fn read_initial_request_line_with_limits(
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
+    let mut poll_wait = REQUEST_POLL_FIRST;
 
     let result = loop {
         let read = match poll_local_stream_read(stream, &mut byte) {
@@ -746,6 +754,7 @@ fn read_initial_request_line_with_limits(
         match read {
             LocalStreamRead::Closed => break Ok(None),
             LocalStreamRead::Data => {
+                poll_wait = REQUEST_POLL_FIRST;
                 bytes.push(byte[0]);
                 if byte[0] == b'\n' {
                     break String::from_utf8(bytes)
@@ -766,7 +775,8 @@ fn read_initial_request_line_with_limits(
                         "timed out reading api request",
                     ));
                 }
-                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                std::thread::sleep(poll_wait);
+                poll_wait = (poll_wait * 2).min(CONNECTION_POLL_INTERVAL);
             }
         }
     };
@@ -862,6 +872,33 @@ mod windows_tests {
             .expect("disconnected connection handler must finish promptly")
             .unwrap();
         server_thread.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_request_written_after_a_short_idle_is_read_well_inside_a_poll_interval() {
+        // A client connects, and its request line arrives 30 ms later, after the server has polled and found nothing. With a flat 100 ms
+        // sleep the line was read about 70 ms after it was written; the sleep that doubles from 250 us reads it within a few ms (BET-9635).
+        let (mut client, mut server, path) = local_stream_pair("short-idle-request");
+        let (read_tx, read_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let line = read_initial_request_line_with_timeout(&mut server, Duration::from_secs(2));
+            read_tx.send((Instant::now(), line)).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        let written_at = Instant::now();
+        client.write_all(b"{\"id\":\"x\"}\n").unwrap();
+        client.flush().unwrap();
+
+        let (read_at, line) = read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(line.unwrap().as_deref(), Some("{\"id\":\"x\"}\n"));
+        let waited = read_at.duration_since(written_at);
+        assert!(
+            waited < Duration::from_millis(40),
+            "the request line was read {waited:?} after it was written"
+        );
+        reader.join().unwrap();
         let _ = std::fs::remove_file(path);
     }
 

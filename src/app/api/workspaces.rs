@@ -338,7 +338,7 @@ impl App {
             .collect::<Vec<_>>();
         self.state.selected = index;
         self.state.close_selected_workspace();
-        self.shutdown_detached_terminal_runtimes();
+        self.shutdown_detached_terminal_runtimes_in_background();
         for (workspace_id, workspace) in closed_workspaces {
             self.emit_event(EventEnvelope {
                 event: EventKind::WorkspaceClosed,
