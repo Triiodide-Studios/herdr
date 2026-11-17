@@ -70,14 +70,23 @@
           "type": "string"
         },
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "waiting",
+              "description": "The agent ended its turn and waits on background work it started. Last, so the statuses an older client or server\nknows keep their positions in the binary encodings.",
+              "type": "string"
+            }
+          ]
         },
         "EventData": {
           "oneOf": [
@@ -1373,14 +1382,23 @@
           "type": "object"
         },
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "waiting",
+              "description": "The agent ended its turn and waits on background work it started. Last, so the statuses an older client or server\nknows keep their positions in the binary encodings.",
+              "type": "string"
+            }
+          ]
         },
         "AgentTarget": {
           "properties": {
@@ -2429,13 +2447,22 @@
           ]
         },
         "PaneAgentState": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "waiting",
+              "description": "The reporter says an otherwise idle agent waits (on its user, a timer, or background work). It only lifts an\nidle pane to `AgentStatus::Waiting`; it never overrides a working or blocked pane. Last, so the states an older\nclient or server knows keep their positions in the binary encodings.",
+              "type": "string"
+            }
+          ]
         },
         "PaneClearAgentAuthorityParams": {
           "properties": {
@@ -6328,14 +6355,23 @@
     "subscription_event": {
       "$defs": {
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "waiting",
+              "description": "The agent ended its turn and waits on background work it started. Last, so the statuses an older client or server\nknows keep their positions in the binary encodings.",
+              "type": "string"
+            }
+          ]
         },
         "PaneAgentStatusChangedEvent": {
           "properties": {
@@ -6767,14 +6803,23 @@
           "type": "string"
         },
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "waiting",
+              "description": "The agent ended its turn and waits on background work it started. Last, so the statuses an older client or server\nknows keep their positions in the binary encodings.",
+              "type": "string"
+            }
+          ]
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -10420,6 +10465,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_status_waiting": {
+              "default": false,
+              "description": "Whether this server reports `waiting` as an agent status, and takes `state = \"waiting\"` in a detection manifest\nrule. A plugin that writes such a rule checks this first: a server without it rejects the whole manifest.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

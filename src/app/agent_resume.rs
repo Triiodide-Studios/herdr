@@ -5,7 +5,13 @@ use ratatui::layout::Rect;
 
 use super::App;
 
+/// How long after this server starts an agent's resume a prompt for it waits for the resumed session to take messages.
+pub(crate) const RESUMED_SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 struct PendingAgentResumeCandidate {
+    /// 0 for an agent pinned in the sidebar, 1 for one that was working, waiting or blocked when the session was saved, 2 for
+    /// the rest: resumes start in this order.
+    rank: u8,
     pane_id: crate::layout::PaneId,
     terminal_id: crate::terminal::TerminalId,
     cwd: std::path::PathBuf,
@@ -57,6 +63,7 @@ impl App {
         let pending = self.pending_agent_resume_candidates();
         let mut changed = false;
         for PendingAgentResumeCandidate {
+            rank: _,
             pane_id,
             terminal_id,
             cwd,
@@ -125,7 +132,20 @@ impl App {
                     let Some(plan) = terminal.pending_agent_resume_plan.clone() else {
                         continue;
                     };
+                    let pinned = !self.pinned_agent_panes.is_empty()
+                        && self
+                            .public_pane_id(ws_idx, info.id)
+                            .is_some_and(|id| self.pinned_agent_panes.contains(&id));
+                    let busy = matches!(
+                        terminal.restored_agent_state,
+                        Some(
+                            crate::detect::AgentState::Working
+                                | crate::detect::AgentState::Waiting
+                                | crate::detect::AgentState::Blocked
+                        )
+                    );
                     pending.push(PendingAgentResumeCandidate {
+                        rank: if pinned { 0 } else if busy { 1 } else { 2 },
                         pane_id: info.id,
                         terminal_id: pane.attached_terminal_id.clone(),
                         cwd: terminal.cwd.clone(),
@@ -136,7 +156,41 @@ impl App {
                 }
             }
         }
+        pending.sort_by_key(|candidate| candidate.rank);
         pending
+    }
+
+    /// A prompt for an agent whose resume waits in the restore queue starts that resume now, ahead of the agents before it.
+    /// Returns whether the agent's resume started within `RESUMED_SESSION_WAIT` or still waits, so that the prompt waits for
+    /// the resumed session to take messages, or why the resume could not start.
+    pub(crate) fn resume_agent_for_prompt(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Result<bool, String> {
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return Ok(false);
+        };
+        if terminal.pending_agent_resume_plan.is_some() {
+            if let Some(candidate) = self
+                .pending_agent_resume_candidates()
+                .into_iter()
+                .find(|candidate| &candidate.terminal_id == terminal_id)
+            {
+                self.start_pending_agent_resume_for_terminal(
+                    terminal_id,
+                    candidate.rows,
+                    candidate.cols,
+                    true,
+                );
+            }
+            if let Some(error) = &self.state.terminals[terminal_id].restore_error {
+                return Err(error.clone());
+            }
+            return Ok(true);
+        }
+        Ok(terminal
+            .agent_resume_started_at
+            .is_some_and(|started| started.elapsed() < RESUMED_SESSION_WAIT))
     }
 
     fn pending_agent_resume_pane_infos(
@@ -313,6 +367,7 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
+            terminal.agent_resume_started_at = Some(Instant::now());
         }
         true
     }
@@ -477,6 +532,79 @@ mod tests {
         }
     }
 
+    // A restore resumes the agents pinned in the sidebar first, then the ones that were working, waiting or blocked when the
+    // session was saved, then the rest, each group in workspace order: the panes being watched and the agents that were mid-task
+    // come back before a hundred idle ones (BET-9635).
+    #[tokio::test]
+    async fn pinned_then_busy_agents_resume_before_the_rest() {
+        let config: crate::config::Config =
+            toml::from_str("[session]\nstartup_per_agent_delay_ms = 100").unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &config,
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = (0..5)
+            .map(|_| crate::workspace::Workspace::test_new("restore"))
+            .collect();
+        app.state.active = Some(0);
+        app.state.view.terminal_area = Rect::new(0, 0, 100, 30);
+        app.state.ensure_test_terminals();
+        let missing = std::env::current_dir()
+            .unwrap()
+            .join("__missing_resume_cwd__");
+        use crate::detect::AgentState;
+        let saved = [
+            Some(AgentState::Idle),
+            Some(AgentState::Working),
+            None,
+            Some(AgentState::Blocked),
+            Some(AgentState::Waiting),
+        ];
+        let terminal_ids: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.terminal_id(ws.tabs[0].root_pane).cloned().unwrap())
+            .collect();
+        for (terminal_id, state) in terminal_ids.iter().zip(saved) {
+            let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+            terminal.cwd = missing.clone();
+            terminal.restored_agent_state = state;
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "claude".into(),
+                argv: vec!["claude".into()],
+                dedupe_key: terminal.id.to_string(),
+            });
+        }
+        let pinned = app
+            .public_pane_id(2, app.state.workspaces[2].tabs[0].root_pane)
+            .unwrap();
+        app.pinned_agent_panes.insert(pinned);
+
+        let now = Instant::now();
+        let mut order = Vec::new();
+        for step in 0..5u32 {
+            assert!(app.start_pending_agent_resumes(
+                now + std::time::Duration::from_millis(100) * step,
+                true
+            ));
+            let started: Vec<usize> = (0..5)
+                .filter(|ws| {
+                    !order.contains(ws)
+                        && app.state.terminals[&terminal_ids[*ws]]
+                            .restore_error
+                            .is_some()
+                })
+                .collect();
+            order.extend(started);
+        }
+        assert_eq!(order, [2, 1, 3, 4, 0]);
+    }
+
     #[cfg(unix)]
     fn long_running_test_argv() -> Vec<String> {
         vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]
@@ -586,6 +714,7 @@ mod tests {
             .expect("terminal should survive launch");
         assert!(terminal.pending_agent_resume_plan.is_none());
         assert!(!terminal.respawn_shell_on_exit);
+        assert!(terminal.agent_resume_started_at.is_some());
 
         let runtime = app
             .terminal_runtimes

@@ -25,7 +25,7 @@ macro_rules! println {
 mod agent;
 mod api;
 mod completion;
-mod fleet;
+pub(crate) mod fleet;
 mod integration;
 mod machine;
 mod notification;
@@ -908,11 +908,12 @@ fn parse_agent_status(value: &str) -> std::io::Result<AgentStatus> {
     match value {
         "idle" => Ok(AgentStatus::Idle),
         "working" => Ok(AgentStatus::Working),
+        "waiting" => Ok(AgentStatus::Waiting),
         "blocked" => Ok(AgentStatus::Blocked),
         "done" => Ok(AgentStatus::Done),
         "unknown" => Ok(AgentStatus::Unknown),
         _ => Err(std::io::Error::other(format!(
-            "invalid agent status: {value} (expected idle, working, blocked, done, or unknown)"
+            "invalid agent status: {value} (expected idle, working, waiting, blocked, done, or unknown)"
         ))),
     }
 }
@@ -923,8 +924,9 @@ pub(super) fn parse_pane_agent_state(value: &str) -> std::io::Result<PaneAgentSt
         "working" => Ok(PaneAgentState::Working),
         "blocked" => Ok(PaneAgentState::Blocked),
         "unknown" => Ok(PaneAgentState::Unknown),
+        "waiting" => Ok(PaneAgentState::Waiting),
         _ => Err(std::io::Error::other(format!(
-            "invalid pane agent state: {value} (expected idle, working, blocked, or unknown)"
+            "invalid pane agent state: {value} (expected idle, working, blocked, unknown, or waiting)"
         ))),
     }
 }

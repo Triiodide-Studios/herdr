@@ -293,7 +293,7 @@ fn validate_field_value(field: &AgentViewField, value: &AgentViewValue) -> Resul
                 AgentViewField::Builtin(AgentViewBuiltinField::Status)
             ) && !matches!(
                 value.as_str(),
-                "idle" | "working" | "blocked" | "done" | "unknown"
+                "idle" | "working" | "waiting" | "blocked" | "done" | "unknown"
             ) {
                 return Err(format!("unknown agent status `{value}`"));
             }
@@ -327,6 +327,7 @@ fn status_name(state: crate::detect::AgentState, seen: bool) -> &'static str {
         (crate::detect::AgentState::Idle, false) => "done",
         (crate::detect::AgentState::Idle, true) => "idle",
         (crate::detect::AgentState::Working, _) => "working",
+        (crate::detect::AgentState::Waiting, _) => "waiting",
         (crate::detect::AgentState::Blocked, _) => "blocked",
         (crate::detect::AgentState::Unknown, _) => "unknown",
     }

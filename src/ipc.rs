@@ -107,11 +107,36 @@ pub(crate) fn prepare_socket_path(
     Ok(())
 }
 
-fn stale_socket_connect_error(kind: io::ErrorKind) -> bool {
+/// A connect error that says nobody listens. A timeout does not: a server that is busy answers late, and a socket taken for
+/// stale on a timeout is deleted from under it (10/30: a second server started beside the live one).
+pub(crate) fn stale_socket_connect_error(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound | io::ErrorKind::TimedOut
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
     ) || (cfg!(windows) && kind == io::ErrorKind::WouldBlock)
+}
+
+/// The process that wrote a Windows socket marker (`<pid>:<unix nanos>`, see `windows_socket_marker`), when it still runs and
+/// started before it wrote the marker: a server whose listener has gone while the server has not still owns its marker, and a
+/// process that took the pid of a server that died did not exist when the marker was written.
+#[cfg(windows)]
+pub(crate) fn live_marker_owner(path: &Path) -> Option<u32> {
+    const UNIX_EPOCH_AS_FILETIME: u128 = 116_444_736_000_000_000;
+    let marker = fs::read_to_string(path).ok()?;
+    let (pid, written_nanos) = marker.trim().split_once(':')?;
+    let pid: u32 = pid.parse().ok()?;
+    let written_nanos: u128 = written_nanos.parse().ok()?;
+    if pid == std::process::id() || !crate::platform::process_exists(pid) {
+        return None;
+    }
+    let started = u128::from(crate::claude_peer::process_start(pid)?);
+    let started_nanos = started.checked_sub(UNIX_EPOCH_AS_FILETIME)? * 100;
+    (started_nanos <= written_nanos).then_some(pid)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn live_marker_owner(_path: &Path) -> Option<u32> {
+    None
 }
 
 pub(crate) fn local_stream_peer_closed(stream: &mut LocalStream) -> io::Result<bool> {
@@ -349,7 +374,11 @@ mod tests {
     fn stale_socket_connect_errors_keep_unix_would_block_strict() {
         assert!(stale_socket_connect_error(io::ErrorKind::ConnectionRefused));
         assert!(stale_socket_connect_error(io::ErrorKind::NotFound));
-        assert!(stale_socket_connect_error(io::ErrorKind::TimedOut));
+        assert!(
+            !stale_socket_connect_error(io::ErrorKind::TimedOut),
+            "a server too busy to answer in time is a live server"
+        );
+        assert!(!stale_socket_connect_error(io::ErrorKind::PermissionDenied));
         assert_eq!(
             stale_socket_connect_error(io::ErrorKind::WouldBlock),
             cfg!(windows)

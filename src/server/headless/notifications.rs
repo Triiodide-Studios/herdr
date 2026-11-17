@@ -610,6 +610,15 @@ impl HeadlessServer {
                 }
                 changed
             }
+            AppEvent::TabSpawned(_) => {
+                // The end of a `tab.create` that did not take focus and opened its pane off the loop (BET-9635): the tab is added and the
+                // request answered, then, as after the synchronous `tab.create`, the client shells learn where it is and the controlled
+                // tab geometry is applied to its pane.
+                let changed = self.app.handle_internal_event_with_render_impact(ev);
+                self.reconcile_client_shell_locations();
+                let geometry_changed = self.reapply_controlled_shell_tab_geometry(false);
+                changed | geometry_changed
+            }
             AppEvent::WorktreeRemoveFinished(result) => {
                 let focus_before = self.shell_focus_targets();
                 let focused_tabs_before = self.focused_shell_tabs();

@@ -46,6 +46,10 @@ impl App {
                 self.handle_api_worktree_read_finished(*result);
                 changes_workspace
             }
+            AppEvent::TabSpawned(spawned) => {
+                self.finish_deferred_tab_create(*spawned);
+                true
+            }
             ev @ AppEvent::TerminalBell { .. } => {
                 self.handle_internal_event(ev);
                 false
@@ -176,6 +180,28 @@ impl App {
 
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             return self.handle_api_worktree_remove_finished(*result);
+        }
+
+        if let AppEvent::TabSpawned(spawned) = ev {
+            self.finish_deferred_tab_create(*spawned);
+            return Vec::new();
+        }
+
+        // The shell of a tab that is still being opened exited before the loop has the tab: hold the event, and `finish_deferred_tab_create`
+        // replays it once the pane exists.
+        if let AppEvent::PaneDied {
+            pane_id,
+            exit_reason,
+        } = &ev
+        {
+            if let Some(pending) = self
+                .pending_tab_spawns
+                .values_mut()
+                .find(|pending| pending.reservation.root_id == *pane_id)
+            {
+                pending.died = Some(*exit_reason);
+                return Vec::new();
+            }
         }
 
         let mut worktree_restore_updates = Vec::new();
@@ -322,8 +348,16 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        let detected_process = if let AppEvent::AgentProcessDetected { pane_id, agent, .. } = &ev {
+            Some((*pane_id, *agent))
+        } else {
+            None
+        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        if let Some((pane_id, agent)) = detected_process {
+            self.record_detected_launch(pane_id, agent);
+        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }
@@ -1740,6 +1774,60 @@ mod tests {
 
         assert_eq!(response["result"]["type"], "pane_process_info");
         assert_eq!(response["result"]["process_info"]["pane_id"], target);
+    }
+
+    /// `pane.process_info` answered off the app loop (BET-9635) says exactly what the synchronous handler says, and a pane that is not there
+    /// is answered at once, on the caller's thread, with the same error.
+    #[tokio::test]
+    async fn deferred_pane_process_info_answers_like_the_synchronous_one_and_a_missing_pane_at_once(
+    ) {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("process-info")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        let params = |pane_id: &str| crate::api::schema::PaneProcessInfoParams {
+            pane_id: Some(pane_id.to_owned()),
+        };
+
+        let synchronous = app.handle_api_request(crate::api::schema::Request {
+            id: "process_info".into(),
+            method: crate::api::schema::Method::PaneProcessInfo(params(&target)),
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.start_deferred_pane_process_info("process_info".into(), params(&target), tx);
+        let deferred = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the deferred pane.process_info is answered");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&deferred).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&synchronous).unwrap()
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.start_deferred_pane_process_info("gone".into(), params("w9:p9"), tx);
+        let answer = rx
+            .try_recv()
+            .expect("a pane that is not there is answered before the call returns");
+        let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer["id"], "gone");
+        assert_eq!(answer["error"]["code"], "pane_not_found");
     }
 
     #[test]

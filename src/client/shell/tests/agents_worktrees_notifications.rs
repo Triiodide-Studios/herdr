@@ -430,6 +430,98 @@ fn pane_cycle_last_and_agent_actions_resolve_to_stable_pane_ids() {
 }
 
 #[test]
+fn a_waiting_agent_has_its_own_dot_text_and_place_between_working_and_idle() {
+    let mut projected = snapshot();
+    for id in ["pane_2", "pane_3"] {
+        let mut pane = projected.panes[0].clone();
+        pane.pane_id = id.into();
+        pane.focused = false;
+        projected.panes.push(pane);
+    }
+    let agent = |pane: &str, name: &str, status| ClientShellAgent {
+        pane_id: pane.into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        name: Some(name.into()),
+        display_agent: None,
+        agent: Some("pi".into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: status,
+        state_change_seq: 1,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: false,
+    };
+    // Listed in the order the sidebar must not keep: idle, waiting, working.
+    projected.agents = vec![
+        agent("pane_1", "calm", AgentStatus::Idle),
+        agent("pane_2", "patient", AgentStatus::Waiting),
+        agent("pane_3", "busy", AgentStatus::Working),
+    ];
+    let mut config = Config::default();
+    config.ui.agent_panel_sort = crate::config::AgentPanelSortConfig::Priority;
+    config.ui.status_indicators = crate::config::StatusIndicatorStyle::Dots;
+    config.ui.sidebar.agents.rows = vec![vec![
+        crate::config::AgentSidebarToken::StateIcon,
+        crate::config::AgentSidebarToken::StateText,
+        crate::config::AgentSidebarToken::Agent,
+    ]];
+    let shell_config = ClientShellConfig::from_config(&config);
+    let palette = shell_config.palette.clone();
+    let mut state = ClientShellState::new(shell_config);
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+
+    let frame = state.compose(106, 30).expect("agent sidebar frame");
+    let rows: Vec<(String, Vec<u32>)> = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            (
+                row.iter().map(|cell| cell.symbol.as_str()).collect::<String>(),
+                row.iter().map(|cell| cell.fg).collect(),
+            )
+        })
+        .collect();
+    let row_of = |text: &str| {
+        rows.iter()
+            .position(|(row, _)| row.contains(text))
+            .unwrap_or_else(|| panic!("no row with {text:?}"))
+    };
+
+    // The position: working, then waiting, then idle.
+    let (busy, patient, calm) = (row_of("busy"), row_of("patient"), row_of("calm"));
+    assert!(busy < patient && patient < calm, "rows {busy} {patient} {calm}");
+    assert_eq!(
+        state
+            .hits
+            .agents
+            .iter()
+            .map(|(_, pane_id)| pane_id.as_str())
+            .collect::<Vec<_>>(),
+        ["pane_3", "pane_2", "pane_1"]
+    );
+    // The text: the status says waiting, in the row of the waiting agent only.
+    assert!(rows[patient].0.contains("waiting"), "row: {}", rows[patient].0);
+    assert!(rows[busy].0.contains("working") && !rows[busy].0.contains("waiting"));
+    // The dot: a filled dot in the warning colour, not the working colour and not the finished one.
+    let dot_color = |row: usize| {
+        let (text, colors) = &rows[row];
+        let column = text
+            .chars()
+            .position(|symbol| symbol == '●')
+            .unwrap_or_else(|| panic!("no dot in {text:?}"));
+        colors[column]
+    };
+    let color = |color| crate::protocol::color_to_u32(color);
+    assert_eq!(dot_color(patient), color(palette.peach));
+    assert_eq!(dot_color(busy), color(palette.yellow));
+    assert_ne!(dot_color(patient), color(palette.teal));
+}
+
+#[test]
 fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
     let mut projected = snapshot();
     let mut second_pane = projected.panes[0].clone();

@@ -270,6 +270,9 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Flags for resuming a Codex session whose launch flags were never recorded (a session.json from before Herdr
+    /// recorded them), for example `["--no-daemon", "-p", "lorefs"]`. Only the flags Herdr records are kept.
+    pub codex_resume_args: Vec<String>,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +280,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            codex_resume_args: Vec::new(),
         }
     }
 }
@@ -1439,6 +1443,21 @@ startup_per_agent_delay_ms = 0
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(config.session.startup_per_agent_delay_ms, 0);
+    }
+
+    #[test]
+    fn codex_resume_args_default_to_none_and_parse() {
+        assert!(Config::default().session.codex_resume_args.is_empty());
+
+        let toml = r#"
+[session]
+codex_resume_args = ["--no-daemon", "-p", "lorefs"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.session.codex_resume_args,
+            vec!["--no-daemon", "-p", "lorefs"]
+        );
     }
 
     #[test]

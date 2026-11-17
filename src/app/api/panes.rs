@@ -521,47 +521,55 @@ impl App {
         id: String,
         params: PaneProcessInfoParams,
     ) -> String {
+        match self.pane_process_info_target(&id, params) {
+            Ok((shell_pid, public_pane_id)) => {
+                pane_process_info_response(id, public_pane_id, shell_pid)
+            }
+            Err(response) => response,
+        }
+    }
+
+    /// `pane.process_info` with the process work off the app loop (BET-9635). The loop resolves the pane and its shell's pid, then a blocking
+    /// thread reads the foreground job (a snapshot of every process, 0.25 to 0.6 s on the 3,000-process workstation when the 3 s cache is
+    /// cold, behind one lock) and each process's working directory, and answers through `respond_to`. On 11/16 these calls (2.5 a second)
+    /// held the loop 280 to 1,173 ms at a time, and every other request waited behind them. Needs a tokio runtime (`spawn_blocking`).
+    pub(crate) fn start_deferred_pane_process_info(
+        &mut self,
+        id: String,
+        params: PaneProcessInfoParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        match self.pane_process_info_target(&id, params) {
+            Err(response) => {
+                let _ = respond_to.send(response);
+            }
+            Ok((shell_pid, public_pane_id)) => {
+                tokio::task::spawn_blocking(move || {
+                    let _ =
+                        respond_to.send(pane_process_info_response(id, public_pane_id, shell_pid));
+                });
+            }
+        }
+    }
+
+    /// The part of `pane.process_info` that needs the app: the pane's public id and its shell's pid, or the error response.
+    fn pane_process_info_target(
+        &mut self,
+        id: &str,
+        params: PaneProcessInfoParams,
+    ) -> Result<(Option<u32>, String), String> {
+        let not_found = || encode_error(id.to_owned(), "pane_not_found", "pane not found");
         let Some((ws_idx, pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref()) else {
-            return encode_error(id, "pane_not_found", "pane not found");
+            return Err(not_found());
         };
         let Some((runtime, _workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
-            return encode_error(id, "pane_not_found", "pane not found");
-        };
-        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
-            return encode_error(id, "pane_not_found", "pane not found");
+            return Err(not_found());
         };
         let shell_pid = runtime.child_pid();
-        let foreground_job = shell_pid.and_then(crate::detect::foreground_job);
-        let foreground_process_group_id = foreground_job.as_ref().map(|job| job.process_group_id);
-        let foreground_processes = foreground_job
-            .map(|job| {
-                job.processes
-                    .into_iter()
-                    .map(|process| PaneProcessInfoProcess {
-                        pid: process.pid,
-                        name: process.name,
-                        argv0: process.argv0,
-                        argv: process.argv,
-                        cmdline: process.cmdline,
-                        cwd: crate::platform::process_cwd(process.pid)
-                            .map(|cwd| cwd.display().to_string()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        encode_success(
-            id,
-            ResponseResult::PaneProcessInfo {
-                process_info: PaneProcessInfo {
-                    pane_id: public_pane_id,
-                    shell_pid,
-                    foreground_process_group_id,
-                    tty: None,
-                    foreground_processes,
-                },
-            },
-        )
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return Err(not_found());
+        };
+        Ok((shell_pid, public_pane_id))
     }
 
     pub(super) fn handle_pane_neighbor(
@@ -1612,12 +1620,18 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
-        let launch_args = (agent_label == "claude")
-            .then(|| self.lookup_runtime(ws_idx, pane_id))
-            .flatten()
-            .and_then(|(runtime, _workspace_id)| {
-                super::super::agents::live_claude_launch_args(runtime)
-            });
+        let launch_args = crate::detect::parse_agent_label(&agent_label)
+            .filter(|agent| {
+                matches!(
+                    agent,
+                    crate::detect::Agent::Claude | crate::detect::Agent::Codex
+                )
+            })
+            .and_then(|agent| {
+                let (runtime, _workspace_id) = self.lookup_runtime(ws_idx, pane_id)?;
+                super::super::agents::live_agent_launch(runtime, agent)
+            })
+            .map(|launch| launch.flags);
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1991,7 +2005,7 @@ impl App {
         if should_close_workspace {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
-            self.shutdown_detached_terminal_runtimes();
+            self.shutdown_detached_terminal_runtimes_in_background();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
                 data: EventData::PaneClosed {
@@ -2008,7 +2022,7 @@ impl App {
             });
         } else {
             self.state.remove_unattached_terminal_ids(terminal_id);
-            self.shutdown_detached_terminal_runtimes();
+            self.shutdown_detached_terminal_runtimes_in_background();
             self.schedule_session_save();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
@@ -2069,7 +2083,7 @@ fn normalize_state_labels(
             let status = status.trim().to_ascii_lowercase();
             if !matches!(
                 status.as_str(),
-                "idle" | "working" | "blocked" | "done" | "unknown"
+                "idle" | "working" | "waiting" | "blocked" | "done" | "unknown"
             ) {
                 return Err(status);
             }
@@ -2307,6 +2321,46 @@ fn split_path_id(idx: usize, path: &[bool]) -> String {
 
 fn invalid_agent(id: String) -> String {
     encode_error(id, "invalid_agent", "agent label must not be empty")
+}
+
+/// The answer to `pane.process_info` for a pane whose shell has `shell_pid`: the foreground job and each process's working directory. All of
+/// it is process work (a snapshot of every process, then a read of each process's parameters) and needs nothing from the app.
+fn pane_process_info_response(
+    id: String,
+    public_pane_id: String,
+    shell_pid: Option<u32>,
+) -> String {
+    let foreground_job = shell_pid.and_then(crate::detect::foreground_job);
+    let foreground_process_group_id = foreground_job.as_ref().map(|job| job.process_group_id);
+    let foreground_processes = foreground_job
+        .map(|job| {
+            job.processes
+                .into_iter()
+                .map(|process| PaneProcessInfoProcess {
+                    pid: process.pid,
+                    name: process.name,
+                    argv0: process.argv0,
+                    argv: process.argv,
+                    cmdline: process.cmdline,
+                    cwd: crate::platform::process_cwd(process.pid)
+                        .map(|cwd| cwd.display().to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    encode_success(
+        id,
+        ResponseResult::PaneProcessInfo {
+            process_info: PaneProcessInfo {
+                pane_id: public_pane_id,
+                shell_pid,
+                foreground_process_group_id,
+                tty: None,
+                foreground_processes,
+            },
+        },
+    )
 }
 
 fn validate_optional_resume_argv(argv: Option<&[String]>) -> Result<(), String> {

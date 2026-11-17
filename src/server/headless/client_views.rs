@@ -806,11 +806,21 @@ impl HeadlessServer {
         self.apply_shell_tab_geometry_to_target(client_id, target, true)
     }
 
-    /// Applies a public socket request, including its session-wide focus projection.
+    /// Applies a public socket request, including its session-wide focus projection, and tells the log which request kept the app loop and
+    /// for how long (BET-9635): the loop serves every key, every API request and the render, and its holds were not visible anywhere.
     pub(super) fn handle_api_request_with_shutdown_check(
         &mut self,
-        mut msg: api::ApiRequestMessage,
+        msg: api::ApiRequestMessage,
     ) -> bool {
+        let started = Instant::now();
+        let method = api::api_method_name(&msg.request.method);
+        let request_id = msg.request.id.clone();
+        let changed = self.apply_api_request_with_shutdown_check(msg);
+        crate::logging::api_loop_held(&request_id, method, started.elapsed());
+        changed
+    }
+
+    fn apply_api_request_with_shutdown_check(&mut self, mut msg: api::ApiRequestMessage) -> bool {
         let target_before = self.default_shell_target();
         let popup_before = self.app.state.popup_pane.is_some();
         let method_claims_geometry = Self::public_request_may_change_geometry(&msg.request.method);

@@ -121,6 +121,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         terminal_attach_owners: HashMap::new(),
         pending_alt_screen_reads: Vec::new(),
         deferred_alt_screen_reads: Vec::new(),
+        loop_phases: crate::logging::LoopPhases::new(),
         next_activity_stamp: 1,
         headless_size,
         effective_size: headless_size,

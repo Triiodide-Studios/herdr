@@ -55,7 +55,14 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
     request_prefix: String,
+    /// When the pane was last read for a snapshot; `None` makes the next quiet poll read it.
+    last_snapshot_at: Option<std::time::Instant>,
 }
+
+/// How often a quiet status subscription reads its pane. Status and presentation changes arrive as events (app/api.rs emits one on
+/// each), so the read is a safety net, not the source: at the connection's 100 ms poll it was ten reads a second per subscription, each
+/// served on the loop that serves keys (BET-9635). A closed or exited pane is read at once.
+const AGENT_STATUS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(super) struct ActiveScrollChangedSubscription {
     pane_id: String,
@@ -232,6 +239,7 @@ impl ActiveSubscription {
                         last_sequence,
                         initial_event,
                         request_prefix: format!("{request_id}:sub:{index}"),
+                        last_snapshot_at: None,
                     },
                 )))
             }
@@ -422,6 +430,13 @@ impl ActiveAgentStatusChangedSubscription {
         &mut self,
         event: crate::api::schema::EventEnvelope,
     ) -> Option<SubscriptionEventEnvelope> {
+        if let crate::api::schema::EventData::PaneClosed { pane_id, .. }
+        | crate::api::schema::EventData::PaneExited { pane_id, .. } = &event.data
+        {
+            if *pane_id == self.pane_id {
+                self.last_snapshot_at = None;
+            }
+        }
         if event.event != EventKind::PaneAgentStatusChanged {
             return None;
         }
@@ -482,6 +497,13 @@ impl ActiveAgentStatusChangedSubscription {
             }));
         }
 
+        if self
+            .last_snapshot_at
+            .is_some_and(|at| at.elapsed() < AGENT_STATUS_SNAPSHOT_INTERVAL)
+        {
+            return Ok(None);
+        }
+        self.last_snapshot_at = Some(std::time::Instant::now());
         let before_snapshot_sequence = self.last_sequence;
         let pane = pane_get(
             format!("{}:pane", self.request_prefix),
@@ -822,6 +844,7 @@ mod tests {
                         state_labels: HashMap::new(),
                     }),
                     request_prefix: "batch".into(),
+                    last_snapshot_at: None,
                 },
             ));
             for (status, title) in [
@@ -857,6 +880,61 @@ mod tests {
             assert_eq!(subscription.last_sequence, event_hub.current_sequence());
             assert!(subscription.initial_event.is_none());
         }
+    }
+
+    /// With no status events, a status subscription reads its pane at most once per snapshot interval, not at every 100 ms poll: each
+    /// read is served on the loop that also serves keys, and a sorter subscribed to 233 agents made 2,330 reads a second (BET-9635).
+    #[test]
+    fn quiet_agent_status_subscription_reads_its_pane_at_most_once_per_snapshot_interval() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let event_hub = EventHub::default();
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let responder = std::thread::spawn(move || {
+            while let Some(request) = api_rx.blocking_recv() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let response = serde_json::to_string(&crate::api::schema::SuccessResponse {
+                    id: request.request.id,
+                    result: crate::api::schema::ResponseResult::PaneInfo {
+                        pane: pane_info_with_scroll(None),
+                    },
+                })
+                .unwrap();
+                let _ = request.respond_to.send(response);
+            }
+        });
+        let pane = pane_info_with_scroll(None);
+        let mut subscription = ActiveSubscription::AgentStatusChanged(Box::new(
+            ActiveAgentStatusChangedSubscription {
+                pane_id: "pane_1".into(),
+                status_filter: None,
+                last_status: Some(pane.agent_status),
+                last_presentation: Some(PanePresentationSnapshot::from(&pane)),
+                last_sequence: event_hub.current_sequence(),
+                initial_event: None,
+                request_prefix: "quiet".into(),
+                last_snapshot_at: None,
+            },
+        ));
+
+        // Twenty polls are two seconds of the connection's 100 ms cadence.
+        for _ in 0..20 {
+            assert!(subscription
+                .poll_batch(&api_tx, &event_hub)
+                .unwrap()
+                .is_empty());
+        }
+        drop(api_tx);
+        responder.join().unwrap();
+        assert!(
+            reads.load(Ordering::SeqCst) <= 1,
+            "a quiet status subscription read its pane {} times in 20 polls",
+            reads.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
@@ -908,6 +986,7 @@ mod tests {
             last_sequence: event_hub.current_sequence(),
             initial_event: None,
             request_prefix: "test".into(),
+            last_snapshot_at: None,
         };
 
         event_hub.push(presentation_event(Some("short lived")));
@@ -953,6 +1032,7 @@ mod tests {
                 state_labels: HashMap::new(),
             }),
             request_prefix: "test".into(),
+            last_snapshot_at: None,
         };
 
         event_hub.push(presentation_event(Some("short lived")));
@@ -998,6 +1078,7 @@ mod tests {
                 state_labels: HashMap::new(),
             }),
             request_prefix: "test".into(),
+            last_snapshot_at: None,
         };
 
         event_hub.push(presentation_event(Some("short lived")));

@@ -79,7 +79,7 @@ impl EndpointAgentPresentation {
             .map(|(_, projection)| projection.completions);
         for agent in &mut snapshot.agents {
             match agent.agent_status {
-                AgentStatus::Working => {
+                AgentStatus::Working | AgentStatus::Waiting => {
                     self.working.insert(agent.pane_id.clone());
                     self.completed.remove(&agent.pane_id);
                 }
@@ -408,6 +408,23 @@ mod tests {
         presentation.project_snapshot(&mut restored);
 
         assert_eq!(restored.agents[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn a_wait_that_ends_projects_done_like_work_that_ends() {
+        // Working, then waiting on background work, then finished: the user has not seen it finish, so it reads done. A
+        // waiting agent is running, so passing through it does not lose the work that was observed.
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut working = snapshot(AgentStatus::Working, 4, 1);
+        presentation.project_snapshot(&mut working);
+        let mut waiting = snapshot(AgentStatus::Waiting, 5, 2);
+        presentation.project_snapshot(&mut waiting);
+        assert_eq!(waiting.agents[0].agent_status, AgentStatus::Waiting);
+        let mut finished = snapshot(AgentStatus::Idle, 6, 3);
+
+        presentation.project_snapshot(&mut finished);
+
+        assert_eq!(finished.agents[0].agent_status, AgentStatus::Done);
     }
 
     #[test]

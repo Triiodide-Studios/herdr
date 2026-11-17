@@ -168,6 +168,58 @@ impl Tab {
             )?
         };
 
+        Ok(Self::assemble_with_argv(
+            number,
+            initial_cwd,
+            layout,
+            root_id,
+            runtime,
+            argv,
+            events,
+            render_notify,
+            render_dirty,
+        ))
+    }
+
+    /// A shell tab whose first pane runtime was opened elsewhere (a blocking thread, so that the app loop did not wait for the PTY and the
+    /// child process): the tab `new` builds once its runtime exists. `layout` and `root_id` are the pair `TileLayout::new` made before the
+    /// runtime was opened for `root_id` (BET-9635).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble(
+        number: usize,
+        initial_cwd: PathBuf,
+        layout: TileLayout,
+        root_id: PaneId,
+        runtime: TerminalRuntime,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> (Self, TerminalState, TerminalRuntime) {
+        Self::assemble_with_argv(
+            number,
+            initial_cwd,
+            layout,
+            root_id,
+            runtime,
+            None,
+            events,
+            render_notify,
+            render_dirty,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_with_argv(
+        number: usize,
+        initial_cwd: PathBuf,
+        layout: TileLayout,
+        root_id: PaneId,
+        runtime: TerminalRuntime,
+        argv: Option<&[String]>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> (Self, TerminalState, TerminalRuntime) {
         let terminal_id = TerminalId::alloc();
         let terminal = match argv {
             Some(argv) => {
@@ -178,7 +230,7 @@ impl Tab {
         let mut panes = HashMap::new();
         panes.insert(root_id, PaneState::new(terminal_id));
 
-        Ok((
+        (
             Self {
                 custom_name: None,
                 number,
@@ -194,7 +246,7 @@ impl Tab {
             },
             terminal,
             runtime,
-        ))
+        )
     }
 
     pub fn is_auto_named(&self) -> bool {

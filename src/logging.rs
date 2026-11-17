@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::EnvFilter;
@@ -125,6 +127,299 @@ pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &s
         method,
         err,
         "api request failed"
+    );
+}
+
+// What the API served and what held the app loop (BET-9635). The log above names only the requests that change the screen, and only
+// when they start and end, and herdr kept no count of the rest: on 11/16 the loop was held for hundreds of milliseconds at a time and
+// 5 of 28 such holds overlapped any logged request. Every request that the connection thread answers is counted here by who sent it
+// (the part of its id before the first ':', "luna" for "luna:agent.get") and its method, reads included, and one line a minute says
+// how many, how long they took and which kept the loop longest. A request that took 100 ms or the loop for 50 ms is also logged alone.
+
+/// A request that took this long, from its read to its answer written, is logged by itself.
+const API_SLOW_REQUEST: Duration = Duration::from_millis(100);
+/// A request that kept the app loop this long is logged by itself.
+const API_LOOP_HELD: Duration = Duration::from_millis(50);
+/// The internal events drained before a request ran for this long are logged by themselves.
+const API_BACKLOG_DRAIN: Duration = Duration::from_millis(50);
+const API_STATS_WINDOW: Duration = Duration::from_secs(60);
+/// Callers and methods are told by the sender, so the table is bounded: beyond this many pairs the rest are counted as "other:other".
+const API_STATS_MAX_KEYS: usize = 128;
+const API_STATS_TOP: usize = 10;
+
+#[derive(Default, Clone, Copy)]
+struct ApiStat {
+    served: u64,
+    served_total: Duration,
+    served_max: Duration,
+    held: u64,
+    held_total: Duration,
+    held_max: Duration,
+}
+
+struct ApiStats {
+    since: Instant,
+    by_key: BTreeMap<String, ApiStat>,
+    slow: u64,
+    held_over: u64,
+}
+
+impl ApiStats {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            by_key: BTreeMap::new(),
+            slow: 0,
+            held_over: 0,
+        }
+    }
+
+    fn stat(&mut self, request_id: &str, method: &str) -> &mut ApiStat {
+        let mut key = format!("{}:{method}", api_caller(request_id));
+        if !self.by_key.contains_key(&key) && self.by_key.len() >= API_STATS_MAX_KEYS {
+            key = "other:other".to_string();
+        }
+        self.by_key.entry(key).or_default()
+    }
+
+    fn record_served(&mut self, request_id: &str, method: &str, elapsed: Duration) {
+        let slow = elapsed >= API_SLOW_REQUEST;
+        let stat = self.stat(request_id, method);
+        stat.served += 1;
+        stat.served_total += elapsed;
+        stat.served_max = stat.served_max.max(elapsed);
+        if slow {
+            self.slow += 1;
+        }
+    }
+
+    fn record_held(&mut self, request_id: &str, method: &str, held: Duration) {
+        let over = held >= API_LOOP_HELD;
+        let stat = self.stat(request_id, method);
+        stat.held += 1;
+        stat.held_total += held;
+        stat.held_max = stat.held_max.max(held);
+        if over {
+            self.held_over += 1;
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now.duration_since(self.since) >= API_STATS_WINDOW
+    }
+
+    /// The pairs that sent the most requests, and the pairs that kept the app loop longest, each as one line of text.
+    fn render(&self) -> (String, String) {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut by_count: Vec<_> = self.by_key.iter().filter(|(_, s)| s.served > 0).collect();
+        by_count.sort_by(|a, b| b.1.served.cmp(&a.1.served).then(a.0.cmp(b.0)));
+        let busiest = by_count
+            .iter()
+            .take(API_STATS_TOP)
+            .map(|(key, s)| {
+                format!(
+                    "{key}={} (avg {:.1} ms, max {:.0} ms)",
+                    s.served,
+                    ms(s.served_total) / s.served as f64,
+                    ms(s.served_max)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut by_held: Vec<_> = self.by_key.iter().filter(|(_, s)| s.held > 0).collect();
+        by_held.sort_by(|a, b| b.1.held_total.cmp(&a.1.held_total).then(a.0.cmp(b.0)));
+        let longest = by_held
+            .iter()
+            .take(API_STATS_TOP)
+            .map(|(key, s)| {
+                format!(
+                    "{key}={} on the loop for {:.0} ms in all (max {:.0} ms)",
+                    s.held,
+                    ms(s.held_total),
+                    ms(s.held_max)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        (busiest, longest)
+    }
+}
+
+/// Who sent a request: the part of its id before the first ':' ("luna" for "luna:agent.get", "cli" for "cli:pane:close"). An id with no
+/// ':' or a long or empty first part is "other".
+fn api_caller(request_id: &str) -> &str {
+    match request_id.split_once(':') {
+        Some((caller, _)) if !caller.is_empty() && caller.len() <= 24 => caller,
+        _ => "other",
+    }
+}
+
+static API_STATS: Mutex<Option<ApiStats>> = Mutex::new(None);
+
+fn with_api_stats(record: impl FnOnce(&mut ApiStats)) {
+    let now = Instant::now();
+    let finished = {
+        let Ok(mut guard) = API_STATS.lock() else {
+            return;
+        };
+        let stats = guard.get_or_insert_with(|| ApiStats::new(now));
+        record(stats);
+        if stats.due(now) {
+            guard.take()
+        } else {
+            None
+        }
+    };
+    if let Some(stats) = finished {
+        let (busiest, longest) = stats.render();
+        let requests: u64 = stats.by_key.values().map(|s| s.served).sum();
+        tracing::info!(
+            event = "api.stats",
+            subsystem = "api",
+            window_s = now.duration_since(stats.since).as_secs(),
+            requests,
+            slow = stats.slow,
+            loop_held_over_50ms = stats.held_over,
+            busiest = %busiest,
+            longest_on_loop = %longest,
+            "api requests served in the last minute"
+        );
+    }
+}
+
+/// A thread for an api connection that took this long to begin, from the accept, is logged by itself.
+const API_THREAD_START_SLOW: Duration = Duration::from_millis(50);
+
+/// A request the connection thread answered, `elapsed` from its read to its answer written (the wait for the app loop included).
+/// `thread_start` is how long the connection's thread took to begin after the accept, and `accept_to_request` how long from the accept to
+/// the request line read (the client's own delay between connecting and writing is in it). A request that is slow, or whose thread was
+/// slow to begin, is logged with both, so that time lost before the request was read is told from time lost waiting for the app loop.
+/// Not called for the requests that wait for something by design (a prompt, an event wait, a subscription).
+pub(crate) fn api_request_served(
+    request_id: &str,
+    method: &'static str,
+    elapsed: Duration,
+    thread_start: Duration,
+    accept_to_request: Duration,
+) {
+    if elapsed >= API_SLOW_REQUEST || thread_start >= API_THREAD_START_SLOW {
+        tracing::warn!(
+            event = "api.request.slow",
+            subsystem = "api",
+            request_id,
+            method,
+            elapsed_ms = elapsed.as_millis() as u64,
+            thread_start_ms = thread_start.as_millis() as u64,
+            accept_to_request_ms = accept_to_request.as_millis() as u64,
+            "api request slow"
+        );
+    }
+    with_api_stats(|stats| stats.record_served(request_id, method, elapsed));
+}
+
+/// A request the app loop handled, `held` from the loop picking it up to its answer sent; nothing else ran on the loop meanwhile.
+pub(crate) fn api_loop_held(request_id: &str, method: &'static str, held: Duration) {
+    if held >= API_LOOP_HELD {
+        tracing::warn!(
+            event = "api.loop.held",
+            subsystem = "api",
+            request_id,
+            method,
+            held_ms = held.as_millis() as u64,
+            "api request held the app loop"
+        );
+    }
+    with_api_stats(|stats| stats.record_held(request_id, method, held));
+}
+
+/// The internal events (pane output, state changes) that the loop drains before it runs an API request: every one that is pending, so a
+/// request that arrives during a burst waits for the whole backlog.
+pub(crate) fn api_backlog_drained(request_id: &str, method: &'static str, drained: Duration) {
+    if drained >= API_BACKLOG_DRAIN {
+        tracing::warn!(
+            event = "api.backlog.drain",
+            subsystem = "api",
+            request_id,
+            method,
+            drained_ms = drained.as_millis() as u64,
+            "internal events drained before an api request"
+        );
+    }
+}
+
+/// A pass of the app loop that did this much work (everything but the wait for the next event) is logged as `loop.slow`.
+const LOOP_SLOW: Duration = Duration::from_millis(100);
+/// A phase is named in a `loop.slow` line only from this long, so that the line stays short.
+const LOOP_PHASE_NAMED: Duration = Duration::from_millis(20);
+
+/// Where one pass of the app loop spends its time: the loop calls `mark` after each of its phases, `skip` after the wait for the next
+/// event, and `finish` at the top of the next pass, which returns the report when the pass did `LOOP_SLOW` of work. A 25 s stall on 11/16
+/// had 7 s in named API handlers and 18 s in work that nothing timed (BET-9635); this says which phase it was in.
+pub(crate) struct LoopPhases {
+    last: std::time::Instant,
+    spent: Vec<(&'static str, Duration)>,
+}
+
+impl LoopPhases {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            spent: Vec::with_capacity(16),
+        }
+    }
+
+    /// Adds the time since the last mark to `label` (the phases of a pass are few, so a linear search does).
+    pub(crate) fn mark(&mut self, label: &'static str) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last);
+        self.last = now;
+        match self.spent.iter_mut().find(|(known, _)| *known == label) {
+            Some((_, total)) => *total += elapsed,
+            None => self.spent.push((label, elapsed)),
+        }
+    }
+
+    /// Forgets the time since the last mark: it was the wait for the next event, not work.
+    pub(crate) fn skip(&mut self) {
+        self.last = std::time::Instant::now();
+    }
+
+    /// Ends the pass: whatever ran since the last mark is `label`'s. Returns the report when the pass did `LOOP_SLOW` of work, and starts the
+    /// next pass either way.
+    pub(crate) fn finish(&mut self, label: &'static str) -> Option<String> {
+        self.mark(label);
+        let report = self.report(LOOP_SLOW);
+        self.spent.clear();
+        report
+    }
+
+    fn report(&self, slow: Duration) -> Option<String> {
+        let busy: Duration = self.spent.iter().map(|(_, spent)| *spent).sum();
+        if busy < slow {
+            return None;
+        }
+        let mut named: Vec<&(&'static str, Duration)> = self
+            .spent
+            .iter()
+            .filter(|(_, spent)| *spent >= LOOP_PHASE_NAMED)
+            .collect();
+        named.sort_by(|a, b| b.1.cmp(&a.1));
+        let named = named
+            .iter()
+            .map(|(label, spent)| format!("{label}={}", spent.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(format!("busy_ms={} phases=\"{named}\"", busy.as_millis()))
+    }
+}
+
+/// One slow pass of the app loop, as `LoopPhases::finish` reported it.
+pub(crate) fn loop_slow(report: &str) {
+    tracing::warn!(
+        event = "loop.slow",
+        subsystem = "loop",
+        report,
+        "app loop pass did a lot of work"
     );
 }
 
@@ -630,5 +925,94 @@ mod tests {
         assert!(!rotated_log_path(&path, 1).exists());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn api_caller_is_the_part_of_the_id_before_the_first_colon() {
+        assert_eq!(api_caller("luna:agent.get"), "luna");
+        assert_eq!(api_caller("cli:pane:close"), "cli");
+        assert_eq!(api_caller("prober"), "other");
+        assert_eq!(api_caller(":x"), "other");
+        assert_eq!(
+            api_caller("a-caller-with-a-very-long-name-indeed:x"),
+            "other"
+        );
+    }
+
+    #[test]
+    fn api_stats_count_each_caller_and_method_and_name_the_longest_on_the_loop() {
+        let mut stats = ApiStats::new(Instant::now());
+        for _ in 0..3 {
+            stats.record_served("luna:1", "agent.get", Duration::from_millis(2));
+        }
+        stats.record_served("cli:2", "pane.close", Duration::from_millis(900));
+        stats.record_held("cli:2", "pane.close", Duration::from_millis(870));
+        stats.record_held("luna:1", "agent.get", Duration::from_millis(3));
+
+        assert_eq!(stats.slow, 1, "only the 900 ms request is slow");
+        assert_eq!(stats.held_over, 1, "only the 870 ms hold is over 50 ms");
+        let (busiest, longest) = stats.render();
+        assert!(
+            busiest.starts_with("luna:agent.get=3 (avg 2.0 ms, max 2 ms)"),
+            "{busiest}"
+        );
+        assert!(busiest.contains("cli:pane.close=1 (avg 900.0 ms, max 900 ms)"));
+        assert!(
+            longest.starts_with("cli:pane.close=1 on the loop for 870 ms in all (max 870 ms)"),
+            "{longest}"
+        );
+    }
+
+    #[test]
+    fn api_stats_window_is_due_after_a_minute_and_the_table_is_bounded() {
+        let start = Instant::now();
+        let mut stats = ApiStats::new(start);
+        assert!(!stats.due(start + Duration::from_secs(59)));
+        assert!(stats.due(start + Duration::from_secs(60)));
+
+        for i in 0..(API_STATS_MAX_KEYS + 40) {
+            stats.record_served(&format!("c{i}:x"), "ping", Duration::ZERO);
+        }
+        assert_eq!(
+            stats.by_key.len(),
+            API_STATS_MAX_KEYS + 1,
+            "the rest fold into other:other"
+        );
+        assert_eq!(stats.by_key["other:other"].served, 40);
+    }
+
+    #[test]
+    fn loop_phases_name_the_phase_that_took_the_time_and_add_up_a_repeated_one() {
+        let mut phases = LoopPhases::new();
+        phases.mark("render_signal");
+        std::thread::sleep(Duration::from_millis(70));
+        phases.mark("scheduled_tasks");
+        std::thread::sleep(Duration::from_millis(70));
+        phases.mark("scheduled_tasks");
+        let report = phases
+            .finish("event:api")
+            .expect("140 ms of work is a slow pass");
+        assert!(report.starts_with("busy_ms=1"), "{report}");
+        assert!(report.contains("scheduled_tasks=1"), "{report}");
+        assert!(
+            !report.contains("render_signal"),
+            "a phase under {LOOP_PHASE_NAMED:?} is not named: {report}"
+        );
+        assert!(
+            phases.finish("event:api").is_none(),
+            "a finished pass starts the next one from nothing"
+        );
+    }
+
+    #[test]
+    fn loop_phases_do_not_count_the_wait_for_the_next_event() {
+        let mut phases = LoopPhases::new();
+        phases.mark("render");
+        std::thread::sleep(Duration::from_millis(150));
+        phases.skip();
+        assert!(
+            phases.finish("event:timer").is_none(),
+            "150 ms of waiting is not work"
+        );
     }
 }

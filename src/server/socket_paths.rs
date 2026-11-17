@@ -74,6 +74,143 @@ pub(crate) fn restrict_socket_permissions(path: &Path) -> io::Result<()> {
     crate::ipc::restrict_socket_permissions(path, SOCKET_PERMISSION_MODE)
 }
 
+/// Says which server already owns the API or client socket, or `None` when nothing does. A starting server asks before it
+/// does anything of its own: its session restore spawns every pane, and its socket setup removes the files of a socket it
+/// takes for stale. 10/30 13:03Z a second server started beside the live one, restored all its panes a second time, and
+/// when it went away took the API socket file with it; the live server could not be reached until it was restarted.
+///
+/// A socket counts as stale only when connecting says nobody listens. One that answers, or fails any other way (busy,
+/// timed out, refused to this user), belongs to a server. So does a marker written by a process that still runs: a server
+/// whose listener has gone has not given up its sockets.
+pub(crate) fn running_server_owner(api_path: &Path, client_path: &Path) -> Option<String> {
+    for path in [client_path, api_path] {
+        match crate::ipc::connect_local_stream(path) {
+            Ok(_) => return Some(format!("{} answers", path.display())),
+            Err(err) if crate::ipc::stale_socket_connect_error(err.kind()) => {}
+            Err(err) => {
+                return Some(format!(
+                    "{} does not answer, and is not gone ({err})",
+                    path.display()
+                ))
+            }
+        }
+    }
+    [api_path, client_path].into_iter().find_map(|path| {
+        crate::ipc::live_marker_owner(path)
+            .map(|pid| format!("process {pid} owns {} and is running", path.display()))
+    })
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn socket_in_temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("herdr-owner-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("herdr.sock")
+    }
+
+    #[test]
+    fn nothing_listening_is_no_server() {
+        let api = socket_in_temp_dir("none-api");
+        let client = socket_in_temp_dir("none-client");
+        assert_eq!(running_server_owner(&api, &client), None);
+    }
+
+    #[test]
+    fn a_socket_that_answers_is_a_running_server_on_either_path() {
+        let api = socket_in_temp_dir("live-api");
+        let client = socket_in_temp_dir("live-client");
+        let listener = crate::ipc::bind_local_listener(&client).unwrap();
+        let owner = running_server_owner(&api, &client).expect("the client socket answers");
+        assert!(owner.contains("answers"), "{owner}");
+        drop(listener);
+        let _ = std::fs::remove_file(&client);
+
+        let listener = crate::ipc::bind_local_listener(&api).unwrap();
+        assert!(running_server_owner(&api, &client).is_some());
+        drop(listener);
+        let _ = std::fs::remove_file(&api);
+        assert_eq!(
+            running_server_owner(&api, &client),
+            None,
+            "the listener is gone and so is its file"
+        );
+    }
+
+    #[test]
+    fn a_socket_file_that_nobody_listens_on_is_stale() {
+        let api = socket_in_temp_dir("stale-api");
+        let client = socket_in_temp_dir("stale-client");
+        let listener = crate::ipc::bind_local_listener(&api).unwrap();
+        drop(listener);
+        assert_eq!(running_server_owner(&api, &client), None);
+    }
+
+    #[cfg(windows)]
+    mod windows {
+        use super::*;
+        use std::process::{Child, Command, Stdio};
+
+        fn sleeping_process() -> Child {
+            Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        }
+
+        fn unix_nanos_now() -> u128 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        }
+
+        #[test]
+        fn a_marker_of_a_running_process_is_a_server_though_its_listener_has_gone() {
+            let api = socket_in_temp_dir("marker-api");
+            let client = socket_in_temp_dir("marker-client");
+            let mut server = sleeping_process();
+            std::fs::write(&api, format!("{}:{}", server.id(), unix_nanos_now())).unwrap();
+
+            let owner =
+                running_server_owner(&api, &client).expect("a live process owns the marker");
+            assert!(owner.contains(&server.id().to_string()), "{owner}");
+
+            server.kill().unwrap();
+            server.wait().unwrap();
+            assert_eq!(
+                running_server_owner(&api, &client),
+                None,
+                "the process is gone, so its marker is stale"
+            );
+        }
+
+        #[test]
+        fn a_marker_older_than_the_process_that_has_its_pid_is_stale() {
+            let api = socket_in_temp_dir("reused-api");
+            let client = socket_in_temp_dir("reused-client");
+            let mut reused = sleeping_process();
+            // written long before this process existed: the server that wrote it died and its pid was taken again
+            std::fs::write(&api, format!("{}:{}", reused.id(), 1_000_000_000_u64)).unwrap();
+            assert_eq!(running_server_owner(&api, &client), None);
+            reused.kill().unwrap();
+            reused.wait().unwrap();
+        }
+
+        #[test]
+        fn a_marker_of_this_process_is_not_another_server() {
+            let api = socket_in_temp_dir("self-api");
+            let client = socket_in_temp_dir("self-client");
+            std::fs::write(&api, format!("{}:{}", std::process::id(), unix_nanos_now())).unwrap();
+            assert_eq!(running_server_owner(&api, &client), None);
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

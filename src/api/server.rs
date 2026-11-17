@@ -27,7 +27,19 @@ mod subscription_socket_tests;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// The first sleep of the poll for a new connection's request line. A Windows named pipe has no read timeout, so the line is polled for;
+/// a client writes its request a few hundred microseconds after it connects, and polling every `CONNECTION_POLL_INTERVAL` made a request
+/// whose first poll came first wait a full interval for nothing. The sleep doubles from here up to the interval, so an idle connection
+/// polls as rarely as before (BET-9635).
+const REQUEST_POLL_FIRST: Duration = Duration::from_micros(250);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+thread_local! {
+    /// When the connection that this thread serves was accepted, and how long its thread took to begin: set by the accept loop's thread
+    /// closure, read when the request is logged. A request that spent most of a second before it was read on 11/16 (the app loop was idle
+    /// meanwhile, in the ETW ring) could not be told from one that waited for the loop (BET-9635).
+    static CONNECTION_TIMES: std::cell::Cell<Option<(Instant, Duration)>> = const { std::cell::Cell::new(None) };
+}
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
@@ -74,6 +86,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        agent_status_waiting: true,
     })
 }
 
@@ -131,20 +144,30 @@ fn start_server_inner(
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = handle_connection_with_stop(
-                        stream,
-                        &api_tx,
-                        &event_hub,
-                        &connection_running,
-                        capabilities,
-                        server_stop.as_ref(),
-                        #[cfg(unix)]
-                        ssh_agents.as_ref(),
-                    ) {
-                        warn!(err = %err, "api connection failed");
-                    }
-                });
+                // A thread that cannot be started costs this connection, not the listener: std::thread::spawn would panic here
+                // and end the accept loop, leaving a server that runs with no API socket behind its marker file.
+                let accepted = Instant::now();
+                let spawned = std::thread::Builder::new()
+                    .name("api-connection".into())
+                    .spawn(move || {
+                        CONNECTION_TIMES
+                            .with(|times| times.set(Some((accepted, accepted.elapsed()))));
+                        if let Err(err) = handle_connection_with_stop(
+                            stream,
+                            &api_tx,
+                            &event_hub,
+                            &connection_running,
+                            capabilities,
+                            server_stop.as_ref(),
+                            #[cfg(unix)]
+                            ssh_agents.as_ref(),
+                        ) {
+                            warn!(err = %err, "api connection failed");
+                        }
+                    });
+                if let Err(err) = spawned {
+                    error!(err = %err, "could not start a thread for an api connection; dropping it");
+                }
             },
         );
         debug!("api server thread exiting");
@@ -172,7 +195,11 @@ fn run_accept_loop<S>(
                     info!(consecutive_errors, "api listener accept recovered");
                     consecutive_errors = 0;
                 }
-                handle(stream);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(stream)))
+                    .is_err()
+                {
+                    error!("api connection handler panicked; the listener keeps serving");
+                }
             }
             Err(err) => {
                 if !running.load(Ordering::Relaxed) {
@@ -214,6 +241,26 @@ mod accept_loop_tests {
         );
 
         assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn keeps_serving_after_a_handler_panics() {
+        let running = AtomicBool::new(true);
+        let mut handled = Vec::new();
+
+        run_accept_loop(
+            [Ok(1), Ok(2), Ok(3)],
+            &running,
+            Duration::ZERO,
+            |stream| {
+                if stream == 2 {
+                    panic!("a connection handler failed");
+                }
+                handled.push(stream);
+            },
+        );
+
+        assert_eq!(handled, vec![1, 3]);
     }
 
     #[test]
@@ -347,6 +394,11 @@ fn handle_connection_with_stop(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+    let request_started = Instant::now();
+    let (thread_start, accept_to_request) = CONNECTION_TIMES
+        .with(|times| times.get())
+        .map(|(accepted, thread_start)| (thread_start, accepted.elapsed()))
+        .unwrap_or_default();
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
@@ -467,6 +519,13 @@ fn handle_connection_with_stop(
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
+            crate::logging::api_request_served(
+                &request_id,
+                method,
+                request_started.elapsed(),
+                thread_start,
+                accept_to_request,
+            );
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -705,6 +764,7 @@ fn read_initial_request_line_with_limits(
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
+    let mut poll_wait = REQUEST_POLL_FIRST;
 
     let result = loop {
         let read = match poll_local_stream_read(stream, &mut byte) {
@@ -714,6 +774,7 @@ fn read_initial_request_line_with_limits(
         match read {
             LocalStreamRead::Closed => break Ok(None),
             LocalStreamRead::Data => {
+                poll_wait = REQUEST_POLL_FIRST;
                 bytes.push(byte[0]);
                 if byte[0] == b'\n' {
                     break String::from_utf8(bytes)
@@ -734,7 +795,8 @@ fn read_initial_request_line_with_limits(
                         "timed out reading api request",
                     ));
                 }
-                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                std::thread::sleep(poll_wait);
+                poll_wait = (poll_wait * 2).min(CONNECTION_POLL_INTERVAL);
             }
         }
     };
@@ -830,6 +892,33 @@ mod windows_tests {
             .expect("disconnected connection handler must finish promptly")
             .unwrap();
         server_thread.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_request_written_after_a_short_idle_is_read_well_inside_a_poll_interval() {
+        // A client connects, and its request line arrives 30 ms later, after the server has polled and found nothing. With a flat 100 ms
+        // sleep the line was read about 70 ms after it was written; the sleep that doubles from 250 us reads it within a few ms (BET-9635).
+        let (mut client, mut server, path) = local_stream_pair("short-idle-request");
+        let (read_tx, read_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let line = read_initial_request_line_with_timeout(&mut server, Duration::from_secs(2));
+            read_tx.send((Instant::now(), line)).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        let written_at = Instant::now();
+        client.write_all(b"{\"id\":\"x\"}\n").unwrap();
+        client.flush().unwrap();
+
+        let (read_at, line) = read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(line.unwrap().as_deref(), Some("{\"id\":\"x\"}\n"));
+        let waited = read_at.duration_since(written_at);
+        assert!(
+            waited < Duration::from_millis(40),
+            "the request line was read {waited:?} after it was written"
+        );
+        reader.join().unwrap();
         let _ = std::fs::remove_file(path);
     }
 
@@ -1443,6 +1532,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_status_waiting: false,
             }),
             None,
             None,

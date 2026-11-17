@@ -41,6 +41,7 @@ use text_editor::TextEditor;
 use word_selection::ClientWordSelection;
 
 pub(in crate::client::shell) use render::sidebar;
+pub(crate) use preferences::pinned_agent_panes;
 pub(crate) use state::*;
 #[cfg(test)]
 pub(super) use surface_patch::apply_composed_surface_patch;
@@ -185,12 +186,13 @@ fn status_icon(
     match (style, status) {
         (
             StatusIndicatorStyle::Dots,
-            AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done,
+            AgentStatus::Working | AgentStatus::Waiting | AgentStatus::Blocked | AgentStatus::Done,
         ) => "●",
         (StatusIndicatorStyle::Dots, AgentStatus::Idle) => "○",
         (StatusIndicatorStyle::Dots, AgentStatus::Unknown) => "·",
         (StatusIndicatorStyle::Symbols, AgentStatus::Blocked) => "×",
         (StatusIndicatorStyle::Symbols, AgentStatus::Working) => "◐",
+        (StatusIndicatorStyle::Symbols, AgentStatus::Waiting) => "◑",
         (StatusIndicatorStyle::Symbols, AgentStatus::Done) => "✓",
         (StatusIndicatorStyle::Symbols, AgentStatus::Idle) => "○",
         (StatusIndicatorStyle::Symbols, AgentStatus::Unknown) => "·",
@@ -204,9 +206,10 @@ fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {
 fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {
     use crate::api::schema::AgentStatus;
     match status {
-        AgentStatus::Blocked => 4,
-        AgentStatus::Done => 3,
-        AgentStatus::Working => 2,
+        AgentStatus::Blocked => 5,
+        AgentStatus::Done => 4,
+        AgentStatus::Working => 3,
+        AgentStatus::Waiting => 2,
         AgentStatus::Idle => 1,
         AgentStatus::Unknown => 0,
     }
@@ -216,6 +219,7 @@ fn status_text(status: crate::api::schema::AgentStatus) -> &'static str {
     use crate::api::schema::AgentStatus;
     match status {
         AgentStatus::Working => "working",
+        AgentStatus::Waiting => "waiting",
         AgentStatus::Blocked => "blocked",
         AgentStatus::Done => "done",
         AgentStatus::Idle => "idle",
@@ -230,6 +234,7 @@ fn status_color(
     use crate::api::schema::AgentStatus;
     match status {
         AgentStatus::Working => palette.yellow,
+        AgentStatus::Waiting => palette.peach,
         AgentStatus::Blocked => palette.red,
         AgentStatus::Done => palette.teal,
         AgentStatus::Idle => palette.green,

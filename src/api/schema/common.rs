@@ -153,6 +153,10 @@ pub enum PaneAgentState {
     Working,
     Blocked,
     Unknown,
+    /// The reporter says an otherwise idle agent waits (on its user, a timer, or background work). It only lifts an
+    /// idle pane to `AgentStatus::Waiting`; it never overrides a working or blocked pane. Last, so the states an older
+    /// client or server knows keep their positions in the binary encodings.
+    Waiting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -163,6 +167,9 @@ pub enum AgentStatus {
     Blocked,
     Done,
     Unknown,
+    /// The agent ended its turn and waits on background work it started. Last, so the statuses an older client or server
+    /// knows keep their positions in the binary encodings.
+    Waiting,
 }
 
 pub(crate) fn default_true() -> bool {

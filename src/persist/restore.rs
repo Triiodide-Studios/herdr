@@ -589,6 +589,7 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.restored_agent_state = saved_pane.and_then(|pane| pane.agent_state);
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -860,13 +861,13 @@ fn pane_restore_startup<'a>(
     }
 }
 
-fn saved_reported_resume(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentResumeSnapshot> {
+pub(super) fn saved_reported_resume(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentResumeSnapshot> {
     pane.agent_resume
         .as_ref()
         .filter(|resume| crate::agent_resume::validate_resume_argv(&resume.argv).is_ok())
 }
 
-fn reported_resume_from_snapshot(
+pub(super) fn reported_resume_from_snapshot(
     resume: &PaneAgentResumeSnapshot,
 ) -> crate::agent_resume::ReportedAgentResume {
     crate::agent_resume::ReportedAgentResume {
@@ -884,12 +885,27 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan_with_launch_args(
-        &session.source,
+    let launch_args = crate::agent_resume::restore_launch_args(
+        &crate::agent_resume::claude_session_records_dir(),
         &session.agent,
         &persisted.session_ref,
         &session.launch_args,
-    )
+    );
+    match crate::integration::codex_dir() {
+        Ok(codex_home) => crate::agent_resume::plan_for_restore(
+            &session.source,
+            &session.agent,
+            &persisted.session_ref,
+            &launch_args,
+            &codex_home,
+        ),
+        Err(_) => crate::agent_resume::plan_with_launch_args(
+            &session.source,
+            &session.agent,
+            &persisted.session_ref,
+            &launch_args,
+        ),
+    }
 }
 
 fn persisted_agent_session_from_snapshot(
@@ -1138,6 +1154,101 @@ mod tests {
             value: test_session_path("claude-session"),
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+    }
+
+    // A session.json written before the clamp names an Opus tab at xhigh or max (BET-9805): the restore, which reads the saved agent_session as it is,
+    // starts it again at medium and every other tab as it was recorded.
+    #[test]
+    fn restore_plan_brings_a_recorded_opus_tab_at_xhigh_or_max_back_at_medium() {
+        let saved = |model: &str, effort: &str| -> super::super::snapshot::PaneAgentSessionSnapshot {
+            serde_json::from_str(&format!(
+                r#"{{"source":"herdr:claude","agent":"claude","kind":"id","value":"claude-session","launch_args":["--model","{model}","--effort","{effort}","--permission-mode","auto"]}}"#
+            ))
+            .unwrap()
+        };
+        for effort in ["xhigh", "max"] {
+            assert_eq!(
+                restore_plan_for_snapshot(&saved("claude-opus-5-5", effort), true)
+                    .unwrap()
+                    .argv,
+                vec![
+                    "claude",
+                    "--resume",
+                    "claude-session",
+                    "--model",
+                    "claude-opus-5-5",
+                    "--effort",
+                    "medium",
+                    "--permission-mode",
+                    "auto"
+                ],
+                "opus at {effort}"
+            );
+            assert_eq!(
+                restore_plan_for_snapshot(&saved("claude-sonnet-5-5", effort), true)
+                    .unwrap()
+                    .argv,
+                vec![
+                    "claude",
+                    "--resume",
+                    "claude-session",
+                    "--model",
+                    "claude-sonnet-5-5",
+                    "--effort",
+                    effort,
+                    "--permission-mode",
+                    "auto"
+                ],
+                "sonnet at {effort}"
+            );
+        }
+        assert!(restore_plan_for_snapshot(&saved("claude-opus-5-5", "xhigh"), false).is_none());
+    }
+
+    // BET-9889: the launch flags in session.json never follow a /model or /effort typed afterwards, so a tab started as Opus and moved to Fable came back
+    // as Opus at xhigh. The record of what the session last ran at (Luna's mod writes it on every change) decides the restore, through the same entry.
+    #[test]
+    fn restore_plan_follows_the_session_record_through_a_change_made_after_launch() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let state = std::env::temp_dir().join(format!("herdr-record-restore-{}", std::process::id()));
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", &state);
+        let records = crate::agent_resume::claude_session_records_dir();
+        std::fs::create_dir_all(&records).unwrap();
+
+        let session_id = "9a1d4c7e-2b53-4f08-8e6a-0c3f5d7b1e24";
+        let launched_as_opus: super::super::snapshot::PaneAgentSessionSnapshot = serde_json::from_str(&format!(
+            r#"{{"source":"herdr:claude","agent":"claude","kind":"id","value":"{session_id}","launch_args":["--model","claude-opus-5-5","--effort","xhigh"]}}"#
+        ))
+        .unwrap();
+        let resumed = |session: &super::super::snapshot::PaneAgentSessionSnapshot| {
+            restore_plan_for_snapshot(session, true).unwrap().argv[3..].to_vec()
+        };
+        let record = |text: &str| std::fs::write(records.join(format!("{session_id}.json")), text).unwrap();
+
+        // no record yet: the launch flags, with the Opus ceiling
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-opus-5-5", "--effort", "medium"]);
+        // /model Fable and /effort low in the tab: the restore starts it as that
+        record(r#"{"model":"claude-fable-5-2","effort":"low"}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-fable-5-2", "--effort", "low"]);
+        // a later change in the same tab is the one the next restore follows
+        record(r#"{"model":"claude-sonnet-5-5","effort":"xhigh"}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-sonnet-5-5", "--effort", "xhigh"]);
+        // Opus at xhigh in the record is still never started at xhigh
+        record(r#"{"model":"claude-opus-5-5","effort":"xhigh"}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-opus-5-5", "--effort", "medium"]);
+        // a record that is half written leaves the launch flags as they are
+        record(r#"{"model":"claude-fable-5-2","eff"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-opus-5-5", "--effort", "medium"]);
+        // a record whose effort is a budget gives its model, and not the effort the launch asked for another model
+        record(r#"{"model":"claude-fable-5-2","effort":8000}"#);
+        assert_eq!(resumed(&launched_as_opus), ["--model", "claude-fable-5-2"]);
+
+        match previous {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -1497,6 +1608,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_state: None,
                         },
                     )]),
                     zoomed: false,
@@ -1546,6 +1658,92 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
+    // A restore resumes the agents that were busy first (BET-9635), so the session records each agent's state. A pane whose resume
+    // still waits records the state it was restored with, not the idle state of the pane that waits, and the state is not part
+    // of the layout: an agent going from working to idle rotates no layout snapshot and orphans no pane history.
+    #[tokio::test]
+    async fn a_waiting_resume_keeps_the_agent_state_it_was_saved_with() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                launch_args: Vec::new(),
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "3c53fb2a-3fd1-4dc5-a857-064c412e0162".into(),
+                            }),
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_state: Some(crate::detect::AgentState::Waiting),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert_eq!(
+            terminal.restored_agent_state,
+            Some(crate::detect::AgentState::Waiting)
+        );
+
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let mut saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        let pane = saved.workspaces[0].tabs[0].panes.values_mut().next().unwrap();
+        assert_eq!(pane.agent_state, Some(crate::detect::AgentState::Waiting));
+        let layout = super::super::snapshot::layout_fingerprint(&saved);
+        saved.workspaces[0].tabs[0]
+            .panes
+            .values_mut()
+            .next()
+            .unwrap()
+            .agent_state = Some(crate::detect::AgentState::Idle);
+        assert_eq!(super::super::snapshot::layout_fingerprint(&saved), layout);
+    }
+
     #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
@@ -1579,6 +1777,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_state: None,
                             },
                         ),
                         (
@@ -1591,6 +1790,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_state: None,
                             },
                         ),
                     ]),
@@ -1645,6 +1845,7 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    agent_state: None,
                 },
             )
         };
@@ -1662,6 +1863,7 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            agent_state: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1815,6 +2017,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_state: None,
                         },
                     )]),
                     zoomed: false,
@@ -2121,6 +2324,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_state: None,
             },
         );
         let mut history = SessionHistorySnapshot {

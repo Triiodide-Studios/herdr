@@ -100,6 +100,20 @@ impl AppPolicy {
     };
 }
 
+/// A `tab.create` whose first pane is being opened on a blocking thread: what the app loop needs to finish the tab and answer the
+/// request when the `AppEvent::TabSpawned` for it arrives (BET-9635).
+pub(crate) struct PendingTabSpawn {
+    pub(crate) request_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) reservation: crate::workspace::TabReservation,
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) label: Option<String>,
+    pub(crate) respond_to: std::sync::mpsc::Sender<String>,
+    /// The `PaneDied` of the first pane, if its shell exited before the loop had the tab: held here and replayed once the tab is registered,
+    /// so it is neither lost (no such pane yet) nor handled twice.
+    pub(crate) died: Option<crate::platform::ChildExitReason>,
+}
+
 pub struct App {
     pub state: AppState,
     pub(crate) pixel_mouse_available: bool,
@@ -126,6 +140,9 @@ pub struct App {
     pub(crate) pending_worktree_remove_runtime_exits: HashMap<crate::layout::PaneId, usize>,
     pub(crate) pending_worktree_remove_runtime_restores: HashMap<crate::layout::PaneId, u64>,
     pub(crate) next_api_worktree_operation_id: u64,
+    /// `tab.create` requests whose first pane is being opened on a blocking thread, by `TabSpawnResult::spawn_id` (BET-9635).
+    pub(crate) pending_tab_spawns: HashMap<u64, PendingTabSpawn>,
+    pub(crate) next_tab_spawn_id: u64,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -135,6 +152,9 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
+    /// The agents pinned in the local client's sidebar (public pane ids), read when a restore leaves resumes waiting: they
+    /// resume first.
+    pinned_agent_panes: std::collections::HashSet<String>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -374,7 +394,8 @@ impl App {
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
             policy.restore_session && snapshot.is_none(),
         )));
-        let (workspaces, active, selected) = if let Some(snap) = snapshot {
+        let (workspaces, active, selected) = if let Some(mut snap) = snapshot {
+            snap.default_codex_launch_args(&config.session.codex_resume_args);
             let history = config
                 .experimental
                 .pane_history
@@ -406,6 +427,14 @@ impl App {
             }
         } else {
             (Vec::new(), None, 0)
+        };
+        let pinned_agent_panes = if restored_terminals
+            .values()
+            .any(|terminal| terminal.pending_agent_resume_plan.is_some())
+        {
+            crate::client::pinned_agent_panes(&crate::server::socket_paths::client_socket_path())
+        } else {
+            std::collections::HashSet::new()
         };
 
         let agent_panel_sort = agent_panel_sort_from_config(config.ui.agent_panel_sort);
@@ -587,6 +616,8 @@ impl App {
             pending_worktree_remove_runtime_exits: HashMap::new(),
             pending_worktree_remove_runtime_restores: HashMap::new(),
             next_api_worktree_operation_id: 1,
+            pending_tab_spawns: HashMap::new(),
+            next_tab_spawn_id: 1,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -600,6 +631,7 @@ impl App {
                 config.session.startup_per_agent_delay_ms.into(),
             ),
             next_agent_resume_at: None,
+            pinned_agent_panes,
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,

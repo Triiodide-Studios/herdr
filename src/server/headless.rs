@@ -68,7 +68,7 @@ use crate::server::pane_input::{
     apply_terminal_attach_scroll, terminal_attach_mouse_position,
 };
 use crate::server::socket_paths::{
-    client_socket_path, prepare_socket_path, restrict_socket_permissions,
+    client_socket_path, prepare_socket_path, restrict_socket_permissions, running_server_owner,
 };
 use crate::server::terminal_attach::paste_payload_for_runtime;
 
@@ -226,6 +226,8 @@ pub struct HeadlessServer {
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
     deferred_alt_screen_reads: Vec<api::ApiRequestMessage>,
+    /// Where the current pass of the loop spends its time, logged as `loop.slow` when a pass does 100 ms of work (BET-9635).
+    loop_phases: crate::logging::LoopPhases,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
     /// Configured virtual terminal size used when no clients are connected.
@@ -280,16 +282,22 @@ fn spawn_windows_client_accept_thread(
 
             let should_quit = should_quit.clone();
             let server_event_tx = server_event_tx.clone();
-            std::thread::spawn(move || {
-                if let Err(err) = crate::server::client_transport::handle_client_handshake(
-                    stream,
-                    client_id,
-                    &server_event_tx,
-                    &should_quit,
-                ) {
-                    debug!(client_id, err = %err, "client handshake failed");
-                }
-            });
+            // A thread that cannot be started costs this client, not the listener (see the API listener in api/server.rs).
+            let spawned = std::thread::Builder::new()
+                .name("client-handshake".into())
+                .spawn(move || {
+                    if let Err(err) = crate::server::client_transport::handle_client_handshake(
+                        stream,
+                        client_id,
+                        &server_event_tx,
+                        &should_quit,
+                    ) {
+                        debug!(client_id, err = %err, "client handshake failed");
+                    }
+                });
+            if let Err(err) = spawned {
+                error!(client_id, err = %err, "could not start a thread for a client handshake; dropping the client");
+            }
         }
     });
 }
@@ -363,6 +371,7 @@ impl HeadlessServer {
             terminal_attach_owners: HashMap::new(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
+            loop_phases: crate::logging::LoopPhases::new(),
             next_activity_stamp: 1,
             headless_size,
             effective_size: headless_size,
@@ -406,6 +415,10 @@ impl HeadlessServer {
         let mut needs_graphics_render = false;
 
         loop {
+            // The pass that just ended: whatever ran after its last mark is "tail".
+            if let Some(report) = self.loop_phases.finish("tail") {
+                crate::logging::loop_slow(&report);
+            }
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
             self.app.reap_finished_detached_processes();
@@ -445,6 +458,7 @@ impl HeadlessServer {
                 needs_graphics_render = false;
                 crate::render_prof::event("full_render_cause.internal_events");
             }
+            self.loop_phases.mark("internal_events");
             if self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
@@ -453,6 +467,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.metadata_expiry");
             }
+            self.loop_phases.mark("metadata");
 
             // 3. Drain API requests.
             if self.drain_api_requests_with_shutdown_check() {
@@ -460,15 +475,18 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
             }
+            self.loop_phases.mark("api_requests");
             if self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
+            self.loop_phases.mark("sync");
 
             // 4. Accept new client connections.
             self.accept_client_connections()?;
+            self.loop_phases.mark("accept_clients");
 
             // 5. Drain server events from client threads.
             if self.drain_server_events() {
@@ -476,6 +494,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.server_events");
             }
+            self.loop_phases.mark("server_events");
             if self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
@@ -488,6 +507,7 @@ impl HeadlessServer {
                 needs_graphics_render = false;
                 crate::render_prof::event("full_render_cause.scheduled_tasks");
             }
+            self.loop_phases.mark("scheduled_tasks");
 
             self.poll_pending_alt_screen_reads(now);
             if self.process_deferred_alt_screen_reads() {
@@ -513,6 +533,7 @@ impl HeadlessServer {
             self.sync_immediate_pty_sources();
             self.stream_host_mouse_capture_mode();
             self.stream_direct_terminal_keyboard_mode();
+            self.loop_phases.mark("misc");
 
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
@@ -572,6 +593,7 @@ impl HeadlessServer {
                     self.render_and_stream();
                 }
                 self.app.record_render_attempt(now, !hidden_only);
+                self.loop_phases.mark("render");
                 needs_render = false;
                 needs_full_render = false;
                 needs_graphics_render = false;
@@ -595,6 +617,7 @@ impl HeadlessServer {
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
                 });
+            self.loop_phases.mark("pre_wait");
             let event = {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
@@ -612,6 +635,15 @@ impl HeadlessServer {
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
+            };
+            // What elapsed in the select was the wait for the next event, not work.
+            self.loop_phases.skip();
+            let event_label = match &event {
+                LoopEvent::Timer => "event:timer",
+                LoopEvent::Internal(_) => "event:internal",
+                LoopEvent::Api(_) => "event:api",
+                LoopEvent::ServerEvent(_) => "event:server",
+                LoopEvent::RenderRequested => "event:render_requested",
             };
 
             if self.should_quit.load(Ordering::Acquire)
@@ -665,6 +697,7 @@ impl HeadlessServer {
                     }
                 }
             }
+            self.loop_phases.mark(event_label);
         }
 
         // Save session on exit.
@@ -2909,20 +2942,30 @@ impl HeadlessServer {
                 &msg.request.method,
                 api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
             );
+        let drain_started = Instant::now();
         changed |= self.drain_all_internal_events_with_forwarding();
+        crate::logging::api_backlog_drained(
+            &msg.request.id,
+            api::api_method_name(&msg.request.method),
+            drain_started.elapsed(),
+        );
+        self.loop_phases.mark("api:drain");
 
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like
         // pane.report_agent trigger handle_internal_event internally, which
         // bypasses drain_internal_events_with_forwarding. Headless mode disables
         // local sound playback, so sound notifications need to be forwarded here.
+        // A request that only reads changes no pane's state, so it skips the comparison (BET-9635).
         let toast_before = self.app.state.toast.clone();
         let pane_states_before: Vec<(
             usize,
             crate::layout::PaneId,
             crate::detect::AgentState,
             Option<String>,
-        )> = {
+        )> = if api::request_reads_only(&msg.request) {
+            Vec::new()
+        } else {
             let terminals = &self.app.state.terminals;
             self.app
                 .state
@@ -2957,6 +3000,29 @@ impl HeadlessServer {
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
+        self.loop_phases.mark("api:pre");
+        // A `tab.create` that does not take focus opens its first pane on a blocking thread, so that the loop does not wait for the PTY and
+        // the child process (BET-9635). It is answered when `AppEvent::TabSpawned` is handled. Every caller of the API passes `--no-focus`; a
+        // request that takes focus, and the window's own, keep the synchronous path and its focus projection.
+        if !client_local
+            && matches!(&msg.request.method, api::schema::Method::TabCreate(params) if !params.focus)
+        {
+            let api::schema::Request { id, method } = msg.request;
+            if let api::schema::Method::TabCreate(params) = method {
+                self.app
+                    .start_deferred_tab_create(id, params, msg.respond_to);
+            }
+            return changed;
+        }
+        // `pane.process_info` reads the process table off the loop (BET-9635): it held the loop 280 to 1,173 ms at a time on 11/16.
+        if matches!(&msg.request.method, api::schema::Method::PaneProcessInfo(_)) {
+            let api::schema::Request { id, method } = msg.request;
+            if let api::schema::Method::PaneProcessInfo(params) = method {
+                self.app
+                    .start_deferred_pane_process_info(id, params, msg.respond_to);
+            }
+            return changed;
+        }
         if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
             let deferred_changed = self
                 .app
@@ -3012,6 +3078,7 @@ impl HeadlessServer {
             self.app
                 .handle_api_request_after_internal_events_drained(msg.request)
         };
+        self.loop_phases.mark("api:handler");
         if let Some(snapshot) = frozen_alt_screen_read {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
             {

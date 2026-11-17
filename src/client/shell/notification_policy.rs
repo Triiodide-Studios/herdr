@@ -304,7 +304,10 @@ impl ClientShellState {
                 NotificationValidation::Current
             }
             SemanticNotificationKind::Finished
-                if agent.agent_status == crate::api::schema::AgentStatus::Working =>
+                if matches!(
+                    agent.agent_status,
+                    crate::api::schema::AgentStatus::Working | crate::api::schema::AgentStatus::Waiting
+                ) =>
             {
                 NotificationValidation::AwaitingSnapshot
             }

@@ -40,6 +40,17 @@ impl App {
         }
     }
 
+    /// `shutdown_detached_terminal_runtimes` for the plain closes of a pane, a tab or a workspace: the app loop closes each PTY and leaves
+    /// the wait for the processes to exit to a thread per pane (BET-9635). A worktree removal keeps the blocking form.
+    pub(crate) fn shutdown_detached_terminal_runtimes_in_background(&mut self) {
+        let terminal_ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
+        for terminal_id in terminal_ids {
+            if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+                runtime.shutdown_in_background();
+            }
+        }
+    }
+
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
     }
