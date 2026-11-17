@@ -871,6 +871,8 @@ pub struct AppState {
     pub agent_manifest_update_status: crate::detect::manifest_update::ManifestUpdateStatus,
     /// Installed or linked plugins known to this running Herdr instance.
     pub(crate) installed_plugins: InstalledPluginRegistry,
+    /// Loads the registry from disk off the app loop; the loop adopts what a load finished.
+    pub(crate) plugin_registry_refresh: crate::app::api::plugins::PluginRegistryRefresh,
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
     /// Session-modal terminal popup. This is intentionally outside workspace layouts.
@@ -1095,6 +1097,7 @@ impl AppState {
             agent_manifest_update_status:
                 crate::detect::manifest_update::ManifestUpdateStatus::default(),
             installed_plugins: std::collections::HashMap::new(),
+            plugin_registry_refresh: Default::default(),
             plugin_panes: std::collections::HashMap::new(),
             popup_pane: None,
             plugin_command_logs: Vec::new(),

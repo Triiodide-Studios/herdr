@@ -31,8 +31,13 @@ impl App {
         let args = command.iter().skip(1).cloned().collect::<Vec<_>>();
         let context_json = serde_json::to_string(context)
             .map_err(|err| ("invalid_plugin_context", err.to_string()))?;
-        super::env::ensure_plugin_user_dirs(plugin)
-            .map_err(|err| ("plugin_user_dir_create_failed", err.to_string()))?;
+        // An event or startup hook runs on the app loop, which must not wait on the disk: its directories are made on the thread
+        // that starts the command, and a failure there is the command's logged result. An action keeps its immediate error.
+        let ensure_dirs_on_thread = event.is_some();
+        if !ensure_dirs_on_thread {
+            super::env::ensure_plugin_user_dirs(plugin)
+                .map_err(|err| ("plugin_user_dir_create_failed", err.to_string()))?;
+        }
         let log_id = format!("plugin-log-{}", self.state.next_plugin_command_log_id);
         self.state.next_plugin_command_log_id += 1;
         let started_unix_ms = current_unix_ms();
@@ -118,13 +123,22 @@ impl App {
         self.push_plugin_command_log(log.clone());
         self.state.plugin_commands_in_flight += 1;
         let event_tx = self.event_tx.clone();
+        let dirs_plugin_id = ensure_dirs_on_thread.then(|| plugin.plugin_id.clone());
         std::thread::spawn(move || {
-            let child =
-                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
-                    .envs(env)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn();
+            let dirs = match dirs_plugin_id {
+                Some(plugin_id) => crate::plugin_paths::ensure_plugin_user_dirs(&plugin_id),
+                None => Ok(()),
+            };
+            let child = match dirs {
+                Ok(()) => {
+                    crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
+                        .envs(env)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                }
+                Err(err) => Err(err),
+            };
             let finished = match child {
                 Ok(mut child) => {
                     let stdout = child.stdout.take();
@@ -220,9 +234,11 @@ impl App {
         if !crate::api::schema::PLUGIN_HOOK_EVENT_KINDS.contains(&event.event) {
             return;
         }
-        if let Err(err) = self.refresh_installed_plugins() {
-            tracing::warn!(err = %err, "failed to refresh plugin registry before event hooks");
-            return;
+        // No file is read here: this runs on the app loop for every such event, and a file system that waits would hold the loop for
+        // as long as it waits. The registry the hooks use is the one the last finished background load produced.
+        self.adopt_refreshed_plugin_registry();
+        if self.policy.persist_plugin_registry {
+            self.state.plugin_registry_refresh.request();
         }
         let plugins = self
             .state

@@ -2,6 +2,7 @@ mod context;
 mod env;
 mod manifest;
 mod panes;
+mod registry_refresh;
 mod runtime;
 
 use super::responses::{encode_error, encode_success};
@@ -21,6 +22,7 @@ use manifest::{
 #[cfg(test)]
 use crate::api::schema::{PluginCommandStatus, PluginInvocationContext};
 pub(crate) use manifest::load_plugin_manifest;
+pub(crate) use registry_refresh::PluginRegistryRefresh;
 #[cfg(test)]
 use runtime::{read_capped_plugin_output, MAX_PLUGIN_COMMANDS_IN_FLIGHT};
 
@@ -40,9 +42,29 @@ impl App {
         if !self.policy.persist_plugin_registry {
             return Ok(());
         }
+        self.state.plugin_registry_refresh.invalidate();
         let entries = crate::persist::plugin_registry::try_load()?;
         self.replace_installed_plugins(entries);
         Ok(())
+    }
+
+    /// Adopts a registry the background refresh has finished loading. Reads no file, so the app loop never waits on one here.
+    fn adopt_refreshed_plugin_registry(&mut self) {
+        if let Some(entries) = self.state.plugin_registry_refresh.take_ready() {
+            self.state.installed_plugins = entries
+                .into_iter()
+                .map(|plugin| (plugin.plugin_id.clone(), plugin))
+                .collect();
+        }
+    }
+
+    /// Runs a background load and adopts its result now (a test has no later event to adopt it).
+    #[cfg(test)]
+    fn settle_plugin_registry_refresh(&mut self) {
+        self.state.plugin_registry_refresh.allow_immediate_request();
+        self.state.plugin_registry_refresh.request();
+        self.state.plugin_registry_refresh.wait_idle();
+        self.adopt_refreshed_plugin_registry();
     }
 
     fn update_installed_plugins<T>(
@@ -52,6 +74,7 @@ impl App {
         if !self.policy.persist_plugin_registry {
             return Ok(mutation(&mut self.state.installed_plugins));
         }
+        self.state.plugin_registry_refresh.invalidate();
         let (result, entries) = crate::persist::plugin_registry::update(|entries| {
             let mut registry = entries
                 .drain(..)
@@ -2628,6 +2651,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         assert_eq!(pane["error"]["code"], "plugin_disabled");
 
         make_stale(&mut app);
+        app.settle_plugin_registry_refresh();
         let logs_before = app.state.plugin_command_logs.len();
         let workspace = app.workspace_info(0);
         app.run_plugin_event_hooks(&crate::api::schema::EventEnvelope {
@@ -3527,6 +3551,115 @@ command = ["sh", "-c", "echo ok"]
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn workspace_focused_event(workspace_id: &str) -> crate::api::schema::EventEnvelope {
+        crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: workspace_id.into(),
+            },
+        }
+    }
+
+    fn app_with_focused_workspace() -> App {
+        let mut app = test_app();
+        app.policy.persist_plugin_registry = true;
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("plugin-hook")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app
+    }
+
+    #[test]
+    fn event_hooks_do_not_wait_for_the_registry_lock() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let base = unique_temp_path("plugin-hook-lock");
+        std::env::set_var("XDG_CONFIG_HOME", &base);
+        let lock_path = crate::config::config_dir().join(".plugins.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.lock().unwrap();
+
+        let mut app = app_with_focused_workspace();
+        let workspace_id = app.public_workspace_id(0);
+        // Whoever holds the registry lock lets go after a while; an event hook that waited for the lock returns only then.
+        let hold = std::time::Duration::from_secs(3);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        app.run_plugin_event_hooks(&workspace_focused_event(&workspace_id));
+        let waited = started.elapsed();
+        releaser.join().unwrap();
+        app.state.plugin_registry_refresh.wait_idle();
+
+        let _ = std::fs::remove_dir_all(&base);
+        match previous_config_home {
+            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert!(
+            waited < hold / 2,
+            "the event hook waited {waited:?} for the registry lock"
+        );
+    }
+
+    #[test]
+    fn event_hooks_see_a_registry_change_only_after_the_background_load() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let base = unique_temp_path("plugin-hook-refresh");
+        std::env::set_var("XDG_CONFIG_HOME", &base);
+        let root = base.join("plugin");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.hook-refresh"
+name = "Hook Refresh"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos", "windows"]
+
+[[events]]
+on = "workspace.focused"
+command = ["herdr-test-hook-program-that-does-not-exist"]
+"#,
+        );
+
+        let mut app = app_with_focused_workspace();
+        let workspace_id = app.public_workspace_id(0);
+        // The CLI links a plugin by writing the registry file while the server runs.
+        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+        crate::persist::plugin_registry::update(|plugins| plugins.push(plugin.clone())).unwrap();
+
+        app.run_plugin_event_hooks(&workspace_focused_event(&workspace_id));
+        assert!(
+            app.state.plugin_command_logs.is_empty(),
+            "the first event read the registry file itself instead of using the registry it had"
+        );
+        app.state.plugin_registry_refresh.wait_idle();
+        app.run_plugin_event_hooks(&workspace_focused_event(&workspace_id));
+        let started = app.state.plugin_command_logs.len();
+
+        let _ = std::fs::remove_dir_all(&base);
+        match previous_config_home {
+            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert_eq!(
+            started, 1,
+            "the hook of a plugin linked on disk did not run once the background load had finished"
+        );
     }
 
     #[test]
