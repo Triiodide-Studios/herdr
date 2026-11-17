@@ -521,47 +521,55 @@ impl App {
         id: String,
         params: PaneProcessInfoParams,
     ) -> String {
+        match self.pane_process_info_target(&id, params) {
+            Ok((shell_pid, public_pane_id)) => {
+                pane_process_info_response(id, public_pane_id, shell_pid)
+            }
+            Err(response) => response,
+        }
+    }
+
+    /// `pane.process_info` with the process work off the app loop (BET-9635). The loop resolves the pane and its shell's pid, then a blocking
+    /// thread reads the foreground job (a snapshot of every process, 0.25 to 0.6 s on the 3,000-process workstation when the 3 s cache is
+    /// cold, behind one lock) and each process's working directory, and answers through `respond_to`. On 11/16 these calls (2.5 a second)
+    /// held the loop 280 to 1,173 ms at a time, and every other request waited behind them. Needs a tokio runtime (`spawn_blocking`).
+    pub(crate) fn start_deferred_pane_process_info(
+        &mut self,
+        id: String,
+        params: PaneProcessInfoParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        match self.pane_process_info_target(&id, params) {
+            Err(response) => {
+                let _ = respond_to.send(response);
+            }
+            Ok((shell_pid, public_pane_id)) => {
+                tokio::task::spawn_blocking(move || {
+                    let _ =
+                        respond_to.send(pane_process_info_response(id, public_pane_id, shell_pid));
+                });
+            }
+        }
+    }
+
+    /// The part of `pane.process_info` that needs the app: the pane's public id and its shell's pid, or the error response.
+    fn pane_process_info_target(
+        &mut self,
+        id: &str,
+        params: PaneProcessInfoParams,
+    ) -> Result<(Option<u32>, String), String> {
+        let not_found = || encode_error(id.to_owned(), "pane_not_found", "pane not found");
         let Some((ws_idx, pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref()) else {
-            return encode_error(id, "pane_not_found", "pane not found");
+            return Err(not_found());
         };
         let Some((runtime, _workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
-            return encode_error(id, "pane_not_found", "pane not found");
-        };
-        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
-            return encode_error(id, "pane_not_found", "pane not found");
+            return Err(not_found());
         };
         let shell_pid = runtime.child_pid();
-        let foreground_job = shell_pid.and_then(crate::detect::foreground_job);
-        let foreground_process_group_id = foreground_job.as_ref().map(|job| job.process_group_id);
-        let foreground_processes = foreground_job
-            .map(|job| {
-                job.processes
-                    .into_iter()
-                    .map(|process| PaneProcessInfoProcess {
-                        pid: process.pid,
-                        name: process.name,
-                        argv0: process.argv0,
-                        argv: process.argv,
-                        cmdline: process.cmdline,
-                        cwd: crate::platform::process_cwd(process.pid)
-                            .map(|cwd| cwd.display().to_string()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        encode_success(
-            id,
-            ResponseResult::PaneProcessInfo {
-                process_info: PaneProcessInfo {
-                    pane_id: public_pane_id,
-                    shell_pid,
-                    foreground_process_group_id,
-                    tty: None,
-                    foreground_processes,
-                },
-            },
-        )
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return Err(not_found());
+        };
+        Ok((shell_pid, public_pane_id))
     }
 
     pub(super) fn handle_pane_neighbor(
@@ -2313,6 +2321,46 @@ fn split_path_id(idx: usize, path: &[bool]) -> String {
 
 fn invalid_agent(id: String) -> String {
     encode_error(id, "invalid_agent", "agent label must not be empty")
+}
+
+/// The answer to `pane.process_info` for a pane whose shell has `shell_pid`: the foreground job and each process's working directory. All of
+/// it is process work (a snapshot of every process, then a read of each process's parameters) and needs nothing from the app.
+fn pane_process_info_response(
+    id: String,
+    public_pane_id: String,
+    shell_pid: Option<u32>,
+) -> String {
+    let foreground_job = shell_pid.and_then(crate::detect::foreground_job);
+    let foreground_process_group_id = foreground_job.as_ref().map(|job| job.process_group_id);
+    let foreground_processes = foreground_job
+        .map(|job| {
+            job.processes
+                .into_iter()
+                .map(|process| PaneProcessInfoProcess {
+                    pid: process.pid,
+                    name: process.name,
+                    argv0: process.argv0,
+                    argv: process.argv,
+                    cmdline: process.cmdline,
+                    cwd: crate::platform::process_cwd(process.pid)
+                        .map(|cwd| cwd.display().to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    encode_success(
+        id,
+        ResponseResult::PaneProcessInfo {
+            process_info: PaneProcessInfo {
+                pane_id: public_pane_id,
+                shell_pid,
+                foreground_process_group_id,
+                tty: None,
+                foreground_processes,
+            },
+        },
+    )
 }
 
 fn validate_optional_resume_argv(argv: Option<&[String]>) -> Result<(), String> {

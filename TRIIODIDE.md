@@ -104,6 +104,23 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   on this one (0 of 120 over 20 ms); all 41 panes were created in every run. The `tab create` call itself takes as long as the
   spawn (it is answered when the tab exists); only the loop is free meanwhile. Not changed: a `tab create` that focuses the new tab
   and `agent.start` still spawn on the loop, and the kernel resource wait that was 57% of the main thread's waits that day is not named.
+  (5) `pane.process_info` is answered off the loop (`App::start_deferred_pane_process_info`): the loop resolves the pane and its shell's
+  pid, a blocking thread reads the foreground job (a snapshot of every process, 0.25 to 0.6 s on this machine when its 3 s cache is cold,
+  behind one lock) and each process's working directory. Over the patch-1 server's 12.8 hours (11/16 19:34 to 11/17 08:09, from the
+  `api.loop.held` lines) it was the largest holder of the loop: 268 holds of 50 ms or more, 43.5 s in all, up to 1,173 ms; Luna and the CLI
+  call it about 2.5 times a second. Throwaway servers, 4 parallel calls every 3.5 s for 10 rounds with a `pane.get` probe running, the
+  build that was live against this one, twice each: probes waited up to 177 and 147 ms (7 and 7 of about 1,150 over 50 ms; the log named
+  `pane.process_info` holds of 101 to 183 ms) against 4 ms (none of 1,202 over 20 ms) in the first patched run; the second patched run
+  had two probes of 1,307 and 1,926 ms, which the log shows were not loop time (item 7). The call itself takes as long as before (median
+  about 220 ms); only the loop is free meanwhile.
+  (6) The log says where one pass of the loop spent its time: `loop.slow` (a pass that did 100 ms of work, not counting the wait for the
+  next event) with the phases of 20 ms or more, by name (`internal_events`, `api_requests`, `scheduled_tasks`, `render`, `event:api`, and,
+  inside an API request, `api:drain`, `api:pre`, `api:handler`). A 25 s stall on 11/16 20:33 had 7 s in named API handlers and 18 s in work
+  that nothing timed.
+  (7) Not a loop cost, and not changed: `api.request.slow` says `thread_start_ms`, the time from accepting a connection to its thread
+  running its first line. On 11/17 08:38 to 08:40 the live server had three starts of 1.2 to 1.6 s, and a throwaway server running at the same
+  time had two of 1.3 and 1.9 s, in the same seconds (the batch nodes were at 100%): after the thread ran, the request took 0 to 40 ms.
+  A request waits for that however idle the loop is.
 
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
 status, the agent prompts and the restore changes also change the server, and a server only takes a new binary by restarting, which

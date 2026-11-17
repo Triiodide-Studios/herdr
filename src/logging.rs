@@ -347,6 +347,82 @@ pub(crate) fn api_backlog_drained(request_id: &str, method: &'static str, draine
     }
 }
 
+/// A pass of the app loop that did this much work (everything but the wait for the next event) is logged as `loop.slow`.
+const LOOP_SLOW: Duration = Duration::from_millis(100);
+/// A phase is named in a `loop.slow` line only from this long, so that the line stays short.
+const LOOP_PHASE_NAMED: Duration = Duration::from_millis(20);
+
+/// Where one pass of the app loop spends its time: the loop calls `mark` after each of its phases, `skip` after the wait for the next
+/// event, and `finish` at the top of the next pass, which returns the report when the pass did `LOOP_SLOW` of work. A 25 s stall on 11/16
+/// had 7 s in named API handlers and 18 s in work that nothing timed (BET-9635); this says which phase it was in.
+pub(crate) struct LoopPhases {
+    last: std::time::Instant,
+    spent: Vec<(&'static str, Duration)>,
+}
+
+impl LoopPhases {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            spent: Vec::with_capacity(16),
+        }
+    }
+
+    /// Adds the time since the last mark to `label` (the phases of a pass are few, so a linear search does).
+    pub(crate) fn mark(&mut self, label: &'static str) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last);
+        self.last = now;
+        match self.spent.iter_mut().find(|(known, _)| *known == label) {
+            Some((_, total)) => *total += elapsed,
+            None => self.spent.push((label, elapsed)),
+        }
+    }
+
+    /// Forgets the time since the last mark: it was the wait for the next event, not work.
+    pub(crate) fn skip(&mut self) {
+        self.last = std::time::Instant::now();
+    }
+
+    /// Ends the pass: whatever ran since the last mark is `label`'s. Returns the report when the pass did `LOOP_SLOW` of work, and starts the
+    /// next pass either way.
+    pub(crate) fn finish(&mut self, label: &'static str) -> Option<String> {
+        self.mark(label);
+        let report = self.report(LOOP_SLOW);
+        self.spent.clear();
+        report
+    }
+
+    fn report(&self, slow: Duration) -> Option<String> {
+        let busy: Duration = self.spent.iter().map(|(_, spent)| *spent).sum();
+        if busy < slow {
+            return None;
+        }
+        let mut named: Vec<&(&'static str, Duration)> = self
+            .spent
+            .iter()
+            .filter(|(_, spent)| *spent >= LOOP_PHASE_NAMED)
+            .collect();
+        named.sort_by(|a, b| b.1.cmp(&a.1));
+        let named = named
+            .iter()
+            .map(|(label, spent)| format!("{label}={}", spent.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(format!("busy_ms={} phases=\"{named}\"", busy.as_millis()))
+    }
+}
+
+/// One slow pass of the app loop, as `LoopPhases::finish` reported it.
+pub(crate) fn loop_slow(report: &str) {
+    tracing::warn!(
+        event = "loop.slow",
+        subsystem = "loop",
+        report,
+        "app loop pass did a lot of work"
+    );
+}
+
 pub(crate) fn api_wait_started(request_id: &str, pane_id: &str, timeout_ms: Option<u64>) {
     tracing::info!(
         event = "api.wait.start",
@@ -903,5 +979,40 @@ mod tests {
             "the rest fold into other:other"
         );
         assert_eq!(stats.by_key["other:other"].served, 40);
+    }
+
+    #[test]
+    fn loop_phases_name_the_phase_that_took_the_time_and_add_up_a_repeated_one() {
+        let mut phases = LoopPhases::new();
+        phases.mark("render_signal");
+        std::thread::sleep(Duration::from_millis(70));
+        phases.mark("scheduled_tasks");
+        std::thread::sleep(Duration::from_millis(70));
+        phases.mark("scheduled_tasks");
+        let report = phases
+            .finish("event:api")
+            .expect("140 ms of work is a slow pass");
+        assert!(report.starts_with("busy_ms=1"), "{report}");
+        assert!(report.contains("scheduled_tasks=1"), "{report}");
+        assert!(
+            !report.contains("render_signal"),
+            "a phase under {LOOP_PHASE_NAMED:?} is not named: {report}"
+        );
+        assert!(
+            phases.finish("event:api").is_none(),
+            "a finished pass starts the next one from nothing"
+        );
+    }
+
+    #[test]
+    fn loop_phases_do_not_count_the_wait_for_the_next_event() {
+        let mut phases = LoopPhases::new();
+        phases.mark("render");
+        std::thread::sleep(Duration::from_millis(150));
+        phases.skip();
+        assert!(
+            phases.finish("event:timer").is_none(),
+            "150 ms of waiting is not work"
+        );
     }
 }
