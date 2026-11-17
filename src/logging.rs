@@ -287,16 +287,30 @@ fn with_api_stats(record: impl FnOnce(&mut ApiStats)) {
     }
 }
 
+/// A thread for an api connection that took this long to begin, from the accept, is logged by itself.
+const API_THREAD_START_SLOW: Duration = Duration::from_millis(50);
+
 /// A request the connection thread answered, `elapsed` from its read to its answer written (the wait for the app loop included).
+/// `thread_start` is how long the connection's thread took to begin after the accept, and `accept_to_request` how long from the accept to
+/// the request line read (the client's own delay between connecting and writing is in it). A request that is slow, or whose thread was
+/// slow to begin, is logged with both, so that time lost before the request was read is told from time lost waiting for the app loop.
 /// Not called for the requests that wait for something by design (a prompt, an event wait, a subscription).
-pub(crate) fn api_request_served(request_id: &str, method: &'static str, elapsed: Duration) {
-    if elapsed >= API_SLOW_REQUEST {
+pub(crate) fn api_request_served(
+    request_id: &str,
+    method: &'static str,
+    elapsed: Duration,
+    thread_start: Duration,
+    accept_to_request: Duration,
+) {
+    if elapsed >= API_SLOW_REQUEST || thread_start >= API_THREAD_START_SLOW {
         tracing::warn!(
             event = "api.request.slow",
             subsystem = "api",
             request_id,
             method,
             elapsed_ms = elapsed.as_millis() as u64,
+            thread_start_ms = thread_start.as_millis() as u64,
+            accept_to_request_ms = accept_to_request.as_millis() as u64,
             "api request slow"
         );
     }

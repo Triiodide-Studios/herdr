@@ -46,6 +46,10 @@ impl App {
                 self.handle_api_worktree_read_finished(*result);
                 changes_workspace
             }
+            AppEvent::TabSpawned(spawned) => {
+                self.finish_deferred_tab_create(*spawned);
+                true
+            }
             ev @ AppEvent::TerminalBell { .. } => {
                 self.handle_internal_event(ev);
                 false
@@ -176,6 +180,28 @@ impl App {
 
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             return self.handle_api_worktree_remove_finished(*result);
+        }
+
+        if let AppEvent::TabSpawned(spawned) = ev {
+            self.finish_deferred_tab_create(*spawned);
+            return Vec::new();
+        }
+
+        // The shell of a tab that is still being opened exited before the loop has the tab: hold the event, and `finish_deferred_tab_create`
+        // replays it once the pane exists.
+        if let AppEvent::PaneDied {
+            pane_id,
+            exit_reason,
+        } = &ev
+        {
+            if let Some(pending) = self
+                .pending_tab_spawns
+                .values_mut()
+                .find(|pending| pending.reservation.root_id == *pane_id)
+            {
+                pending.died = Some(*exit_reason);
+                return Vec::new();
+            }
         }
 
         let mut worktree_restore_updates = Vec::new();

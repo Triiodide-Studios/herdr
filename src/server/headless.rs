@@ -2972,6 +2972,19 @@ impl HeadlessServer {
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
+        // A `tab.create` that does not take focus opens its first pane on a blocking thread, so that the loop does not wait for the PTY and
+        // the child process (BET-9635). It is answered when `AppEvent::TabSpawned` is handled. Every caller of the API passes `--no-focus`; a
+        // request that takes focus, and the window's own, keep the synchronous path and its focus projection.
+        if !client_local
+            && matches!(&msg.request.method, api::schema::Method::TabCreate(params) if !params.focus)
+        {
+            let api::schema::Request { id, method } = msg.request;
+            if let api::schema::Method::TabCreate(params) = method {
+                self.app
+                    .start_deferred_tab_create(id, params, msg.respond_to);
+            }
+            return changed;
+        }
         if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
             let deferred_changed = self
                 .app

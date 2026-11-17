@@ -33,6 +33,13 @@ pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100)
 /// polls as rarely as before (BET-9635).
 const REQUEST_POLL_FIRST: Duration = Duration::from_micros(250);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+thread_local! {
+    /// When the connection that this thread serves was accepted, and how long its thread took to begin: set by the accept loop's thread
+    /// closure, read when the request is logged. A request that spent most of a second before it was read on 11/16 (the app loop was idle
+    /// meanwhile, in the ETW ring) could not be told from one that waited for the loop (BET-9635).
+    static CONNECTION_TIMES: std::cell::Cell<Option<(Instant, Duration)>> = const { std::cell::Cell::new(None) };
+}
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
@@ -139,9 +146,12 @@ fn start_server_inner(
                 let ssh_agents = ssh_agents.clone();
                 // A thread that cannot be started costs this connection, not the listener: std::thread::spawn would panic here
                 // and end the accept loop, leaving a server that runs with no API socket behind its marker file.
+                let accepted = Instant::now();
                 let spawned = std::thread::Builder::new()
                     .name("api-connection".into())
                     .spawn(move || {
+                        CONNECTION_TIMES
+                            .with(|times| times.set(Some((accepted, accepted.elapsed()))));
                         if let Err(err) = handle_connection_with_stop(
                             stream,
                             &api_tx,
@@ -385,6 +395,10 @@ fn handle_connection_with_stop(
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
     let request_started = Instant::now();
+    let (thread_start, accept_to_request) = CONNECTION_TIMES
+        .with(|times| times.get())
+        .map(|(accepted, thread_start)| (thread_start, accepted.elapsed()))
+        .unwrap_or_default();
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
@@ -505,7 +519,13 @@ fn handle_connection_with_stop(
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
-            crate::logging::api_request_served(&request_id, method, request_started.elapsed());
+            crate::logging::api_request_served(
+                &request_id,
+                method,
+                request_started.elapsed(),
+                thread_start,
+                accept_to_request,
+            );
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,

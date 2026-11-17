@@ -92,8 +92,18 @@ Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (th
   (3) The log says what the API served: one `api.stats` line a minute (requests by sender, the part of the request id before the
   first `:`, and method, reads included, with the average and longest time, and the requests that kept the loop longest);
   `api.request.slow` for a request that took 100 ms, `api.loop.held` for one that kept the loop 50 ms, and `api.backlog.drain`
-  when the internal events drained before a request took 50 ms. Not changed: pane spawn still runs on the loop (`tab.create` took
-  5.7 s once on 11/16), and the kernel resource wait that was 57% of the main thread's waits that day is not named.
+  when the internal events drained before a request took 50 ms. `api.request.slow` also says how long the connection thread took
+  to start (`thread_start_ms`) and how long the request line took to arrive after the accept (`accept_to_request_ms`), so a slow
+  request that was slow before it reached the loop shows as that.
+  (4) A `tab create` that does not focus the new tab (`--no-focus`, not client-local) opens its first pane on a blocking thread
+  and adds the tab when the pane's event arrives (`App::start_deferred_tab_create`, `finish_deferred_tab_create`; the numbers are
+  reserved up front by `Workspace::reserve_tab`, so two creates in flight take different tab and pane numbers, and a shell that
+  exits before its tab exists is held and replayed). The loop no longer waits for CreateProcess, which took 5.7 s once on 11/16.
+  Throwaway servers, 4 bursts of 10 no-focus creates with a `pane.get` probe running throughout, the deployed build against this
+  one, twice each: the probes sent during a burst waited up to 51 and 82 ms on the deployed build (8 of 63 over 20 ms) and up to 5 ms
+  on this one (0 of 120 over 20 ms); all 41 panes were created in every run. The `tab create` call itself takes as long as the
+  spawn (it is answered when the tab exists); only the loop is free meanwhile. Not changed: a `tab create` that focuses the new tab
+  and `agent.start` still spawn on the loop, and the kernel resource wait that was 57% of the main thread's waits that day is not named.
 
 Pins, New chat and chat search change only the window (the client): reopen it to pick them up. The `waiting`
 status, the agent prompts and the restore changes also change the server, and a server only takes a new binary by restarting, which

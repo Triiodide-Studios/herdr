@@ -100,6 +100,20 @@ impl AppPolicy {
     };
 }
 
+/// A `tab.create` whose first pane is being opened on a blocking thread: what the app loop needs to finish the tab and answer the
+/// request when the `AppEvent::TabSpawned` for it arrives (BET-9635).
+pub(crate) struct PendingTabSpawn {
+    pub(crate) request_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) reservation: crate::workspace::TabReservation,
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) label: Option<String>,
+    pub(crate) respond_to: std::sync::mpsc::Sender<String>,
+    /// The `PaneDied` of the first pane, if its shell exited before the loop had the tab: held here and replayed once the tab is registered,
+    /// so it is neither lost (no such pane yet) nor handled twice.
+    pub(crate) died: Option<crate::platform::ChildExitReason>,
+}
+
 pub struct App {
     pub state: AppState,
     pub(crate) pixel_mouse_available: bool,
@@ -126,6 +140,9 @@ pub struct App {
     pub(crate) pending_worktree_remove_runtime_exits: HashMap<crate::layout::PaneId, usize>,
     pub(crate) pending_worktree_remove_runtime_restores: HashMap<crate::layout::PaneId, u64>,
     pub(crate) next_api_worktree_operation_id: u64,
+    /// `tab.create` requests whose first pane is being opened on a blocking thread, by `TabSpawnResult::spawn_id` (BET-9635).
+    pub(crate) pending_tab_spawns: HashMap<u64, PendingTabSpawn>,
+    pub(crate) next_tab_spawn_id: u64,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -599,6 +616,8 @@ impl App {
             pending_worktree_remove_runtime_exits: HashMap::new(),
             pending_worktree_remove_runtime_restores: HashMap::new(),
             next_api_worktree_operation_id: 1,
+            pending_tab_spawns: HashMap::new(),
+            next_tab_spawn_id: 1,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled

@@ -213,4 +213,30 @@ pub enum AppEvent {
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
     /// Background worktree discovery completed for an API list/open request.
     WorktreeReadFinished(Box<WorktreeReadResult>),
+    /// A new tab's first pane was opened on a blocking thread (the PTY and the child process), for the app loop to finish the tab with.
+    TabSpawned(Box<TabSpawnResult>),
+}
+
+/// The first pane of a tab that `tab.create` asked for, opened off the app loop: opening a ConPTY and starting a child took the loop
+/// 76 ms on an idle server and 1.4 s to 3.6 s on 11/16, while every key and every API request waited (BET-9635).
+pub struct TabSpawnResult {
+    /// Which pending `tab.create` this is: the key into the app's pending spawns.
+    pub spawn_id: u64,
+    pub result: std::io::Result<crate::terminal::TerminalRuntime>,
+}
+
+impl std::fmt::Debug for TabSpawnResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TabSpawnResult")
+            .field("spawn_id", &self.spawn_id)
+            .field(
+                "result",
+                &self
+                    .result
+                    .as_ref()
+                    .map(|_| "runtime")
+                    .map_err(|e| e.to_string()),
+            )
+            .finish()
+    }
 }

@@ -172,6 +172,18 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     }
 }
 
+/// What a new tab took from its workspace before its first pane was opened off the app loop (`Workspace::reserve_tab`): the numbers the tab
+/// and its pane will have, the handles the pane reports through, and the pane tree's first pane (BET-9635).
+pub(crate) struct TabReservation {
+    pub(crate) number: usize,
+    pub(crate) pane_number: usize,
+    pub(crate) events: mpsc::Sender<AppEvent>,
+    pub(crate) render_notify: Arc<Notify>,
+    pub(crate) render_dirty: Arc<RenderSignal>,
+    pub(crate) layout: crate::layout::TileLayout,
+    pub(crate) root_id: PaneId,
+}
+
 /// A named workspace containing tabs.
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
@@ -570,6 +582,72 @@ impl Workspace {
         self.register_new_pane_with_number(tab.root_pane, pane_number);
         self.tabs.push(tab);
         Ok((self.tabs.len() - 1, terminal, runtime))
+    }
+
+    /// The first half of `create_tab` for a shell tab whose first pane is opened off the app loop (BET-9635): takes the tab and pane numbers
+    /// and the pane tree's first pane now, and returns what the pane starts with. Two creates in flight take different numbers. A create that
+    /// fails leaves its numbers unused, as `create_tab` does for the tab number.
+    pub(crate) fn reserve_tab(
+        &mut self,
+        extra_env: Vec<(String, String)>,
+    ) -> (TabReservation, crate::pane::PaneLaunchEnv) {
+        let number = self.next_public_tab_number;
+        self.next_public_tab_number += 1;
+        let pane_number = self.next_public_pane_number;
+        self.next_public_pane_number += 1;
+        let launch_env = self.launch_env_for_new_pane(number, pane_number, extra_env);
+        let active = self
+            .active_tab()
+            .expect("workspace must always have at least one tab");
+        let (events, render_notify, render_dirty) = (
+            active.events.clone(),
+            active.render_notify.clone(),
+            active.render_dirty.clone(),
+        );
+        let (layout, root_id) = crate::layout::TileLayout::new();
+        (
+            TabReservation {
+                number,
+                pane_number,
+                events,
+                render_notify,
+                render_dirty,
+                layout,
+                root_id,
+            },
+            launch_env,
+        )
+    }
+
+    /// The second half: adds the tab whose first pane runtime was opened for `reservation.root_id`. Returns what `create_tab` returns.
+    pub(crate) fn add_reserved_tab(
+        &mut self,
+        reservation: TabReservation,
+        cwd: PathBuf,
+        runtime: TerminalRuntime,
+    ) -> (usize, TerminalState, TerminalRuntime) {
+        let TabReservation {
+            number,
+            pane_number,
+            events,
+            render_notify,
+            render_dirty,
+            layout,
+            root_id,
+        } = reservation;
+        let (tab, terminal, runtime) = Tab::assemble(
+            number,
+            cwd,
+            layout,
+            root_id,
+            runtime,
+            events,
+            render_notify,
+            render_dirty,
+        );
+        self.register_new_pane_with_number(tab.root_pane, pane_number);
+        self.tabs.push(tab);
+        (self.tabs.len() - 1, terminal, runtime)
     }
 
     pub fn close_tab(&mut self, idx: usize) -> bool {
