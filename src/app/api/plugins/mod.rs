@@ -58,6 +58,15 @@ impl App {
         }
     }
 
+    /// Brings the registry up to date for a caller that must not wait on the disk: adopts what the last background load produced
+    /// and asks for the next one. Everything this server changed itself is already in the registry it has.
+    fn refresh_installed_plugins_off_the_loop(&mut self) {
+        self.adopt_refreshed_plugin_registry();
+        if self.policy.persist_plugin_registry {
+            self.state.plugin_registry_refresh.request();
+        }
+    }
+
     /// Runs a background load and adopts its result now (a test has no later event to adopt it).
     #[cfg(test)]
     fn settle_plugin_registry_refresh(&mut self) {
@@ -115,9 +124,9 @@ impl App {
             Ok(plugin_id) => plugin_id,
             Err(response) => return response,
         };
-        if let Err(err) = self.refresh_installed_plugins() {
-            return encode_error(id, "plugin_registry_load_failed", err.to_string());
-        }
+        // `herdr plugin ...` commands ask for this list on the app loop, and a file system that waits would hold the loop for as long
+        // as it waits, so the list is the registry the last finished background load produced.
+        self.refresh_installed_plugins_off_the_loop();
         let mut plugins = self
             .state
             .installed_plugins
@@ -3660,6 +3669,112 @@ command = ["herdr-test-hook-program-that-does-not-exist"]
             started, 1,
             "the hook of a plugin linked on disk did not run once the background load had finished"
         );
+    }
+
+    fn plugin_list_ids(app: &mut App) -> Vec<String> {
+        let list = app.handle_api_request(Request {
+            id: "list".into(),
+            method: Method::PluginList(PluginListParams { plugin_id: None }),
+        });
+        let ResponseResult::PluginList { plugins } = response_result(&list) else {
+            panic!("expected plugin list response: {list}");
+        };
+        plugins.into_iter().map(|plugin| plugin.plugin_id).collect()
+    }
+
+    #[test]
+    fn plugin_list_does_not_wait_for_the_registry_lock() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let base = unique_temp_path("plugin-list-lock");
+        std::env::set_var("XDG_CONFIG_HOME", &base);
+        let lock_path = crate::config::config_dir().join(".plugins.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.lock().unwrap();
+
+        let mut app = app_with_focused_workspace();
+        // Whoever holds the registry lock lets go after a while; a list that waited for the lock returns only then.
+        let hold = std::time::Duration::from_secs(3);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let ids = plugin_list_ids(&mut app);
+        let waited = started.elapsed();
+        releaser.join().unwrap();
+        app.state.plugin_registry_refresh.wait_idle();
+
+        let _ = std::fs::remove_dir_all(&base);
+        match previous_config_home {
+            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert!(
+            waited < hold / 2,
+            "plugin.list waited {waited:?} for the registry lock"
+        );
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn plugin_list_sees_a_registry_file_change_only_after_the_background_load() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let base = unique_temp_path("plugin-list-refresh");
+        std::env::set_var("XDG_CONFIG_HOME", &base);
+        let root = base.join("plugin");
+        write_manifest(&root);
+        let mut app = app_with_focused_workspace();
+        // A registry file written by another process while the server runs.
+        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+        crate::persist::plugin_registry::update(|plugins| plugins.push(plugin.clone())).unwrap();
+
+        let first = plugin_list_ids(&mut app);
+        app.state.plugin_registry_refresh.wait_idle();
+        let second = plugin_list_ids(&mut app);
+
+        let _ = std::fs::remove_dir_all(&base);
+        match previous_config_home {
+            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert!(
+            first.is_empty(),
+            "the first list read the registry file itself: {first:?}"
+        );
+        assert_eq!(second, vec![plugin.plugin_id]);
+    }
+
+    #[test]
+    fn plugin_list_shows_a_plugin_linked_through_the_api_at_once() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let base = unique_temp_path("plugin-list-link");
+        std::env::set_var("XDG_CONFIG_HOME", &base);
+        let root = base.join("plugin");
+        write_manifest(&root);
+        let mut app = app_with_focused_workspace();
+        // A load that began before the link must not bring back a registry without it.
+        app.state.plugin_registry_refresh.request();
+        link_manifest(&mut app, &root);
+        app.state.plugin_registry_refresh.wait_idle();
+
+        let ids = plugin_list_ids(&mut app);
+
+        let _ = std::fs::remove_dir_all(&base);
+        match previous_config_home {
+            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert_eq!(ids, vec!["example.worktree-bootstrap".to_string()]);
     }
 
     #[test]

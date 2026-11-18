@@ -236,10 +236,7 @@ impl App {
         }
         // No file is read here: this runs on the app loop for every such event, and a file system that waits would hold the loop for
         // as long as it waits. The registry the hooks use is the one the last finished background load produced.
-        self.adopt_refreshed_plugin_registry();
-        if self.policy.persist_plugin_registry {
-            self.state.plugin_registry_refresh.request();
-        }
+        self.refresh_installed_plugins_off_the_loop();
         let plugins = self
             .state
             .installed_plugins
