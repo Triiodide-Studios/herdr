@@ -1,8 +1,8 @@
 # Triiodide herdr patches
 
 Stock [herdr](https://github.com/herdrdev/herdr) plus changes to the sidebar (the window) and to the server (the
-`waiting` status and agent prompts). The branch
-`triiodide/agent-context-menu` sits on the upstream release tag it was built from (now `v0.9.3`).
+`waiting` status and agent prompts). The fork’s default branch is `triiodide/agent-context-menu`.
+The current upstream merge includes `herdrdev/herdr` commit `ee5bfb50` (0.9.5).
 
 - Right-click an agent row: Pin / Unpin, Rename, Clear name (after a rename), Copy chat ID (the agent's
   session id, e.g. what `claude --resume` takes; local machine only), Close.
@@ -177,17 +177,13 @@ three full runs passed 3311 of 3311 and touched nothing real. It also unsets
 
 ## Install
 
-Copy `target/release/herdr` (`herdr.exe` on Windows) beside the stock install, and have whatever
-opens the herdr window run it. Keep starting the server with the stock binary.
-On Windows, rename a running copy aside (`herdr.exe.inuse-<date>`) before replacing it.
+Stage the tested `herdr.exe` beside the stock Windows installation, with the matching app-local
+ConPTY files. Point both the server and Noctty client at the same candidate. Keep the previous
+client and server binaries available for rollback. The Windows server restart restores saved panes
+and supported agent sessions, and terminates the processes currently running in those panes.
 
-## After a herdr update
+## Updating from upstream
 
-The patched client must match the server's version. Rebase onto the new tag and rebuild:
-
-```sh
-git fetch --tags upstream
-git rebase --onto vX.Y.Z v0.9.3 triiodide/agent-context-menu
-```
-
-Update the tag named at the top of this file, then push the branch and the tag.
+Fetch `upstream/master` and merge it into `triiodide/agent-context-menu`. Run the isolated
+Windows tests and verify a disposable session restores, then push the tested commit to the
+fork's default branch.

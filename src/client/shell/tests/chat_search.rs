@@ -186,6 +186,10 @@ fn typing_keeps_only_the_matching_chats_in_the_agents_panel() {
         "the count replaces the sort label: {text}"
     );
     assert!(
+        text.contains(" agents (3)"),
+        "the busy count is the whole fleet's, not the matches': {text}"
+    );
+    assert!(
         rows[row_of(&rows, " search") + 1].contains("sunl"),
         "{text}"
     );

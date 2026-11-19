@@ -146,6 +146,16 @@ impl App {
         &mut self,
         params: AgentStartParams,
     ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+        self.start_agent_after_shell_check(params, ShellCheck::Now)
+    }
+
+    /// `start_agent`, with the check that the pane's shell has no child process either made here or already made by the caller off the app
+    /// loop (`shell`). Everything else is checked here, now, against the app as it is.
+    pub(super) fn start_agent_after_shell_check(
+        &mut self,
+        params: AgentStartParams,
+        shell: ShellCheck,
+    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
         let name = params.name;
         if !valid_agent_name(&name) {
             return Err(AgentStartError::InvalidName);
@@ -191,8 +201,11 @@ impl App {
             .terminal_runtimes
             .get(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
-        let shell_name = available_shell_name(runtime)
-            .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
+        let shell_name = match shell {
+            ShellCheck::Now => available_shell_name(runtime),
+            ShellCheck::Done(shell_name) => shell_name,
+        }
+        .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
         let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
         argv.extend(params.args);
@@ -207,6 +220,10 @@ impl App {
         if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
             return Err(AgentStartError::InvalidTimeout);
         }
+
+        runtime
+            .validate_input_submission(&bytes)
+            .map_err(|err| AgentStartError::InputFailed(err.to_string()))?;
 
         let now = Instant::now();
         let terminal = self
@@ -374,7 +391,7 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let pane = self.pane_info(ws_idx, pane_id)?;
+        let pane = self.pane_metadata(ws_idx, pane_id)?;
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -452,6 +469,14 @@ impl App {
             })
             .collect()
     }
+}
+
+/// Whether the shell of the pane an agent is started in has no child process, and how it was found out.
+pub(super) enum ShellCheck {
+    /// Not checked yet: `start_agent_after_shell_check` reads the process table itself.
+    Now,
+    /// Checked off the app loop: the shell's name when it was idle, `None` when it was busy or not a shell.
+    Done(Option<String>),
 }
 
 fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {

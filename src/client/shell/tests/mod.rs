@@ -249,11 +249,13 @@ mod agent_context_menu;
 mod agents_worktrees_notifications;
 mod chat_search;
 mod chrome_context;
+mod close_pane;
 mod close_tab;
 mod copy;
 mod endpoint_requests;
 mod endpoints;
 mod graphics;
+mod input_conformance;
 #[path = "input.rs"]
 mod input_domain;
 mod keybindings_settings;

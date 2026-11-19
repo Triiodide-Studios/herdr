@@ -33,6 +33,17 @@ pub(super) struct AgentFilter<'a> {
 
 const PIN_MARKER: &str = "📌";
 
+/// How many of these agents are working or waiting; idle, done, blocked and unknown ones are not counted.
+pub(super) fn busy_agent_count(
+    statuses: impl IntoIterator<Item = crate::api::schema::AgentStatus>,
+) -> usize {
+    use crate::api::schema::AgentStatus;
+    statuses
+        .into_iter()
+        .filter(|status| matches!(status, AgentStatus::Working | AgentStatus::Waiting))
+        .count()
+}
+
 /// The agents panel order: pinned panes first, in the order they were pinned, then the rest in
 /// the active view's or built-in sort's order.
 pub(super) fn ordered_agent_pane_ids(
@@ -94,7 +105,8 @@ pub(super) fn render_agent_panel(
     let label = filter
         .map(|filter| filter.label.as_str())
         .or(snapshot.agent_view_label.as_deref());
-    if !render_agent_panel_header(buffer, area, label, config, hits) {
+    let busy = busy_agent_count(snapshot.agents.iter().map(|agent| agent.agent_status));
+    if !render_agent_panel_header(buffer, area, busy, label, config, hits) {
         return;
     }
 
@@ -141,6 +153,7 @@ pub(super) fn render_agent_panel(
 pub(super) fn render_agent_panel_header(
     buffer: &mut Buffer,
     area: Rect,
+    busy_agents: usize,
     agent_view_label: Option<&str>,
     config: &ClientShellConfig,
     hits: &mut ShellHitMap,
@@ -164,7 +177,7 @@ pub(super) fn render_agent_panel_header(
         area.x,
         area.y + 1,
         area.width,
-        " agents",
+        &format!(" agents ({busy_agents})"),
         Style::default()
             .fg(config.palette.overlay0)
             .add_modifier(Modifier::BOLD),

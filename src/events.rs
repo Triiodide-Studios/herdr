@@ -192,6 +192,12 @@ pub enum AppEvent {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },
+    /// Background validation of a saved membership after session restore.
+    RestoredWorktreeSpaceChecked {
+        workspace_id: String,
+        expected: crate::workspace::WorktreeSpaceMembership,
+        valid: bool,
+    },
     /// A configured tab bar status command finished.
     TabBarCommandFinished {
         generation: u64,
@@ -215,6 +221,19 @@ pub enum AppEvent {
     WorktreeReadFinished(Box<WorktreeReadResult>),
     /// A new tab's first pane was opened on a blocking thread (the PTY and the child process), for the app loop to finish the tab with.
     TabSpawned(Box<TabSpawnResult>),
+    /// An `agent.start` whose pane shell was checked for running children on a blocking thread, for the app loop to finish the start with.
+    AgentStartShellChecked(Box<AgentStartShellCheck>),
+}
+
+/// An `agent.start` request with the answer of the check that its pane's shell is idle, made off the app loop: the check reads the process
+/// table of the whole machine, 0.1 to 1 s on the 3,000-process workstation, and every start held the loop for that long (BET-9635).
+#[derive(Debug)]
+pub struct AgentStartShellCheck {
+    pub request_id: String,
+    pub params: crate::api::schema::AgentStartParams,
+    /// The shell's name when it has no child process, the pane being free for the agent; `None` when it is busy or is not a shell.
+    pub shell_name: Option<String>,
+    pub respond_to: std::sync::mpsc::Sender<String>,
 }
 
 /// The first pane of a tab that `tab.create` asked for, opened off the app loop: opening a ConPTY and starting a child took the loop

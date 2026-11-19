@@ -79,6 +79,61 @@ impl App {
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
     }
 
+    /// `agent.start` with the check that the pane's shell has no child process made off the app loop. The check reads the process table of
+    /// the whole machine (0.1 to 1 s on the 3,000-process workstation, 190 ms on average over the starts of one morning), and every start
+    /// held the loop for that long (BET-9635). The loop finds the shell's pid and returns; a blocking thread makes the check and sends
+    /// `AppEvent::AgentStartShellChecked`, and `finish_deferred_agent_start` does everything else, on the loop, against the app as it is then.
+    /// A pane with no shell process to look at (it is gone, or has none) is answered here at once, by the synchronous path.
+    pub(crate) fn start_deferred_agent_start(
+        &mut self,
+        id: String,
+        params: AgentStartParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        let Some(shell_pid) = self.agent_start_shell_pid(&params.pane_id) else {
+            let _ = respond_to.send(self.handle_agent_start(id, params));
+            return;
+        };
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let shell_name = crate::platform::available_pane_shell(shell_pid);
+            let _ = event_tx.blocking_send(crate::events::AppEvent::AgentStartShellChecked(
+                Box::new(crate::events::AgentStartShellCheck {
+                    request_id: id,
+                    params,
+                    shell_name,
+                    respond_to,
+                }),
+            ));
+        });
+    }
+
+    fn agent_start_shell_pid(&self, public_pane_id: &str) -> Option<u32> {
+        let (ws_idx, pane_id) = self.parse_current_public_pane_id(public_pane_id)?;
+        let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
+        self.terminal_runtimes.get(terminal_id)?.child_pid()
+    }
+
+    /// The end of `start_deferred_agent_start`, on the app loop: starts the agent, or answers why it cannot be started, and tells the caller.
+    pub(crate) fn finish_deferred_agent_start(&mut self, check: crate::events::AgentStartShellCheck) {
+        let crate::events::AgentStartShellCheck {
+            request_id,
+            params,
+            shell_name,
+            respond_to,
+        } = check;
+        let response = match self.start_agent_after_shell_check(
+            params,
+            crate::app::agents::ShellCheck::Done(shell_name),
+        ) {
+            Ok((agent, argv)) => {
+                encode_success(request_id, ResponseResult::AgentStarted { agent, argv })
+            }
+            Err(err) => encode_error_body(request_id, self.agent_start_error_body(err)),
+        };
+        let _ = respond_to.send(response);
+    }
+
     pub(crate) fn handle_deferred_agent_api_request(
         &mut self,
         request: crate::api::schema::Request,
@@ -87,19 +142,47 @@ impl App {
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
-        match self.queue_agent_prompt(request.id, params) {
-            Ok((id, agent, completion)) => {
-                std::thread::spawn(move || {
-                    let response = match completion.recv() {
-                        Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
-                        Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
-                            encode_error(id, "timeout", err.to_string())
-                        }
-                        Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
-                        Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
-                    };
-                    let _ = respond_to.send(response);
-                });
+        let validated = match self.validate_agent_prompt(request.id, &params) {
+            Ok(validated) => validated,
+            Err(response) => {
+                let _ = respond_to.send(response);
+                return true;
+            }
+        };
+        // Start the completion waiter before submitting, so a refused thread
+        // fails the request while nothing has been sent yet.
+        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<(
+            String,
+            crate::api::schema::AgentInfo,
+            std::sync::mpsc::Receiver<std::io::Result<()>>,
+        )>();
+        let waiter_respond_to = respond_to.clone();
+        let spawned = crate::thread_spawn::spawn_named("herdr-agent-prompt", move || {
+            let Ok((id, agent, completion)) = handoff_rx.recv() else {
+                return;
+            };
+            let response = match completion.recv() {
+                Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    encode_error(id, "timeout", err.to_string())
+                }
+                Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
+                Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
+            };
+            let _ = waiter_respond_to.send(response);
+        });
+        if let Err(err) = spawned {
+            tracing::warn!(err = %err, "failed to spawn agent prompt thread");
+            let _ = respond_to.send(encode_error(
+                validated.id,
+                "agent_prompt_failed",
+                format!("could not start prompt completion waiter: {err}"),
+            ));
+            return true;
+        }
+        match self.submit_agent_prompt(validated, &params) {
+            Ok(submission) => {
+                let _ = handoff_tx.send(submission);
             }
             Err(response) => {
                 let _ = respond_to.send(response);
@@ -108,18 +191,12 @@ impl App {
         true
     }
 
-    fn queue_agent_prompt(
-        &mut self,
+    /// Runs every check that can reject a prompt without touching the pane.
+    fn validate_agent_prompt(
+        &self,
         id: String,
-        params: AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+        params: &AgentPromptParams,
+    ) -> Result<ValidatedAgentPrompt, String> {
         if params.text.is_empty() {
             return Err(encode_error(
                 id,
@@ -145,7 +222,17 @@ impl App {
         };
         #[cfg(windows)]
         if terminal.effective_known_agent() == Some(crate::detect::Agent::Claude) {
-            return self.queue_claude_message(id, &params, &terminal_id);
+            let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+                return Err(agent_not_found(id, &params.target));
+            };
+            return Ok(ValidatedAgentPrompt {
+                id,
+                ws_idx: resolved.ws_idx,
+                pane_id: resolved.pane_id,
+                expected_agent: crate::detect::Agent::Claude,
+                agent,
+                claude_terminal: Some(terminal_id),
+            });
         }
         if terminal.state == crate::detect::AgentState::Blocked {
             return Err(encode_error(
@@ -191,6 +278,45 @@ impl App {
                 ),
             ));
         }
+        Ok(ValidatedAgentPrompt {
+            id,
+            ws_idx: resolved.ws_idx,
+            pane_id: resolved.pane_id,
+            expected_agent,
+            agent,
+            #[cfg(windows)]
+            claude_terminal: None,
+        })
+    }
+
+    fn submit_agent_prompt(
+        &mut self,
+        validated: ValidatedAgentPrompt,
+        params: &AgentPromptParams,
+    ) -> Result<
+        (
+            String,
+            crate::api::schema::AgentInfo,
+            std::sync::mpsc::Receiver<std::io::Result<()>>,
+        ),
+        String,
+    > {
+        let ValidatedAgentPrompt {
+            id,
+            ws_idx,
+            pane_id,
+            expected_agent,
+            agent,
+            #[cfg(windows)]
+            claude_terminal,
+        } = validated;
+        #[cfg(windows)]
+        if let Some(terminal_id) = claude_terminal {
+            return self.queue_claude_message(id, params, &terminal_id);
+        }
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return Err(agent_not_found(id, &params.target));
+        };
         #[cfg(windows)]
         let submit_deadline = params
             .wait
@@ -263,12 +389,18 @@ impl App {
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        let Some(session) = agent.agent_session.as_ref().map(|session| session.value.clone())
+        let Some(session) = agent
+            .agent_session
+            .as_ref()
+            .map(|session| session.value.clone())
         else {
             return Err(encode_error(
                 id,
                 "agent_not_ready",
-                format!("agent {} has not reported its Claude session yet", params.target),
+                format!(
+                    "agent {} has not reported its Claude session yet",
+                    params.target
+                ),
             ));
         };
         let Some(dir) = crate::claude_peer::sessions_dir() else {
@@ -291,10 +423,11 @@ impl App {
                 done,
             );
         } else {
-            std::thread::spawn(move || {
+            crate::thread_spawn::spawn_named("herdr-claude-prompt", move || {
                 let sent = crate::claude_peer::deliver(&session, &text, &dir, &machine);
                 let _ = done.send(sent.map_err(|err| std::io::Error::other(err.to_string())));
-            });
+            })
+            .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         }
         Ok((id, agent, completion))
     }
@@ -457,6 +590,16 @@ impl App {
     }
 }
 
+struct ValidatedAgentPrompt {
+    id: String,
+    ws_idx: usize,
+    pane_id: crate::layout::PaneId,
+    expected_agent: crate::detect::Agent,
+    agent: crate::api::schema::AgentInfo,
+    #[cfg(windows)]
+    claude_terminal: Option<crate::terminal::TerminalId>,
+}
+
 fn agent_not_ready(id: String, target: &str) -> String {
     encode_error(
         id,
@@ -521,6 +664,158 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    fn agent_start_params(pane_id: &str, name: &str) -> AgentStartParams {
+        AgentStartParams {
+            name: name.into(),
+            kind: "codex".into(),
+            pane_id: pane_id.into(),
+            args: Vec::new(),
+            timeout_ms: Some(4_000),
+        }
+    }
+
+    /// The app, its first pane's public id, the pane's terminal id, and the channel its runtime sends keystrokes to.
+    fn app_with_idle_shell_pane() -> (
+        App,
+        String,
+        crate::terminal::TerminalId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        let mut app = app_with_agent();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        (app, pane_id, terminal_id, rx)
+    }
+
+    fn shell_check(
+        pane_id: &str,
+        name: &str,
+        shell_name: Option<&str>,
+    ) -> (
+        crate::events::AgentStartShellCheck,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        (
+            crate::events::AgentStartShellCheck {
+                request_id: "req_agent_start".into(),
+                params: agent_start_params(pane_id, name),
+                shell_name: shell_name.map(str::to_string),
+                respond_to,
+            },
+            response_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_agent_start_whose_shell_was_checked_off_the_loop_is_finished_by_the_event() {
+        let (mut app, pane_id, terminal_id, mut rx) = app_with_idle_shell_pane();
+        let (check, response_rx) = shell_check(&pane_id, "worker", Some("sh"));
+
+        let changed = app.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::AgentStartShellChecked(Box::new(check)),
+        );
+
+        assert!(changed, "the app has to be drawn again");
+        let response = response_rx
+            .try_recv()
+            .expect("the event answers the request");
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentStarted { .. }
+        ));
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_name.as_deref(),
+            Some("worker")
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the agent's command line was typed into the pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_start_whose_shell_was_found_busy_is_refused_and_changes_nothing() {
+        let (mut app, pane_id, _terminal_id, mut rx) = app_with_idle_shell_pane();
+        let (check, response_rx) = shell_check(&pane_id, "worker", None);
+
+        app.finish_deferred_agent_start(check);
+
+        let response: serde_json::Value =
+            serde_json::from_str(&response_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], "agent_pane_busy");
+        assert!(app.state.terminals.values().all(|t| t.agent_name.is_none()));
+        assert!(rx.try_recv().is_err(), "nothing was typed into the pane");
+    }
+
+    #[tokio::test]
+    async fn an_agent_start_is_checked_against_the_app_as_it_is_when_the_loop_finishes_it() {
+        // The shell check ran before another request took the name; the start is validated when the loop gets to it, not when it began.
+        let (mut app, pane_id, _terminal_id, mut rx) = app_with_idle_shell_pane();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].tabs[0].panes[&other]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&other_terminal).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let (check, response_rx) = shell_check(&pane_id, "worker", Some("sh"));
+
+        app.finish_deferred_agent_start(check);
+
+        let response: serde_json::Value =
+            serde_json::from_str(&response_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], "agent_name_taken");
+        assert!(rx.try_recv().is_err(), "nothing was typed into the pane");
+    }
+
+    #[tokio::test]
+    async fn an_agent_start_in_a_pane_with_no_shell_process_is_answered_at_once() {
+        // A runtime without a child process (the test one, or a pane whose shell is gone) leaves nothing to look at off the loop.
+        let (mut app, pane_id, _terminal_id, mut rx) = app_with_idle_shell_pane();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+
+        app.start_deferred_agent_start(
+            "req_agent_start".into(),
+            agent_start_params(&pane_id, "worker"),
+            respond_to,
+        );
+
+        let response = response_rx
+            .try_recv()
+            .expect("answered before start_deferred_agent_start returned");
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentStarted { .. }
+        ));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_agent_start_in_a_pane_that_is_gone_is_answered_at_once() {
+        let (mut app, _pane_id, _terminal_id, _rx) = app_with_idle_shell_pane();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+
+        app.start_deferred_agent_start(
+            "req_agent_start".into(),
+            agent_start_params("w9:p9", "worker"),
+            respond_to,
+        );
+
+        let response: serde_json::Value =
+            serde_json::from_str(&response_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], "agent_pane_not_found");
     }
 
     #[cfg(windows)]
@@ -702,8 +997,8 @@ mod tests {
     #[cfg(windows)]
     mod claude_message {
         use super::*;
-        use crate::claude_peer::{key_file_name, Machine, PeerError, TEST_MACHINE};
         use crate::agent_resume::{AgentSessionRef, PersistedAgentSession};
+        use crate::claude_peer::{key_file_name, Machine, PeerError, TEST_MACHINE};
         use std::sync::Mutex;
 
         const SESSION: &str = "3c53fb2a-3fd1-4dc5-a857-064c412e0162";
@@ -778,7 +1073,10 @@ mod tests {
         }
 
         /// A Claude agent in the pane the user is working in, whose input box shows `typed`.
-        fn claude_pane(typed: &[u8], state: AgentState) -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+        fn claude_pane(
+            typed: &[u8],
+            state: AgentState,
+        ) -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
             let mut app = app_with_agent();
             let pane_id = app.state.workspaces[0].tabs[0].root_pane;
             let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
@@ -813,15 +1111,19 @@ mod tests {
         }
 
         async fn nothing_typed(rx: &mut tokio::sync::mpsc::Receiver<Bytes>) -> bool {
-            tokio::time::timeout(AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(150), rx.recv())
-                .await
-                .is_err()
+            tokio::time::timeout(
+                AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(150),
+                rx.recv(),
+            )
+            .await
+            .is_err()
         }
 
         #[tokio::test]
         async fn a_prompt_leaves_the_text_in_the_input_box_untouched_and_still_arrives() {
             let _fixture = Fixture::new(true);
-            let (mut app, mut rx) = claude_pane(b"> fix the door in level 4 and also", AgentState::Idle);
+            let (mut app, mut rx) =
+                claude_pane(b"> fix the door in level 4 and also", AgentState::Idle);
             let response = prompt(&mut app, "[bet land] Your land did not submit: <CL> 22890");
             let success: SuccessResponse = serde_json::from_str(&response).unwrap();
             assert!(
@@ -829,14 +1131,20 @@ mod tests {
                 "{response}"
             );
 
-            assert!(nothing_typed(&mut rx).await, "bytes reached the pane: its input box was written to");
+            assert!(
+                nothing_typed(&mut rx).await,
+                "bytes reached the pane: its input box was written to"
+            );
             let sent = SENT.lock().unwrap();
             assert_eq!(sent.len(), 1, "one message");
             let (pipe, wire) = &sent[0];
             assert_eq!(pipe, PIPE);
             let lines: Vec<&str> = wire.split_terminator('\n').collect();
             assert_eq!(lines.len(), 2, "{wire:?}");
-            assert!(lines[0].contains("\"auth\"") && lines[0].contains("0123456789abcdef0123456789abcdef"));
+            assert!(
+                lines[0].contains("\"auth\"")
+                    && lines[0].contains("0123456789abcdef0123456789abcdef")
+            );
             let message: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
             assert_eq!(
                 message["message"]["content"],
@@ -847,11 +1155,18 @@ mod tests {
         #[tokio::test]
         async fn an_agent_waiting_on_a_prompt_still_gets_the_message_and_nothing_is_typed() {
             let _fixture = Fixture::new(true);
-            let (mut app, mut rx) = claude_pane(b"Do you want to proceed? 1. Yes", AgentState::Blocked);
+            let (mut app, mut rx) =
+                claude_pane(b"Do you want to proceed? 1. Yes", AgentState::Blocked);
             let response = prompt(&mut app, "wake up");
             let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-            assert!(matches!(success.result, ResponseResult::AgentPrompted { .. }), "{response}");
-            assert!(nothing_typed(&mut rx).await, "an answer was typed into the blocking prompt");
+            assert!(
+                matches!(success.result, ResponseResult::AgentPrompted { .. }),
+                "{response}"
+            );
+            assert!(
+                nothing_typed(&mut rx).await,
+                "an answer was typed into the blocking prompt"
+            );
             assert_eq!(SENT.lock().unwrap().len(), 1);
         }
 
@@ -862,8 +1177,18 @@ mod tests {
             let response = prompt(&mut app, "wake up");
             let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
             assert_eq!(error.error.code, "agent_prompt_failed");
-            assert!(error.error.message.contains("no Claude Code session record"), "{}", error.error.message);
-            assert!(nothing_typed(&mut rx).await, "the prompt fell back to typing");
+            assert!(
+                error
+                    .error
+                    .message
+                    .contains("no Claude Code session record"),
+                "{}",
+                error.error.message
+            );
+            assert!(
+                nothing_typed(&mut rx).await,
+                "the prompt fell back to typing"
+            );
             assert!(SENT.lock().unwrap().is_empty());
         }
 
@@ -875,7 +1200,11 @@ mod tests {
             let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
-            app.state.terminals.get_mut(&terminal_id).unwrap().persisted_agent_session = None;
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .persisted_agent_session = None;
             let response = prompt(&mut app, "wake up");
             let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
             assert_eq!(error.error.code, "agent_not_ready");
@@ -910,16 +1239,28 @@ mod tests {
             let response = prompt(&mut app, "wake up");
             let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
             assert_eq!(error.error.code, "agent_resume_failed", "{response}");
-            assert!(error.error.message.contains("Saved directory is unavailable"), "{}", error.error.message);
-            assert!(app.state.terminals[&terminal_id].pending_agent_resume_plan.is_none());
+            assert!(
+                error
+                    .error
+                    .message
+                    .contains("Saved directory is unavailable"),
+                "{}",
+                error.error.message
+            );
+            assert!(app.state.terminals[&terminal_id]
+                .pending_agent_resume_plan
+                .is_none());
             assert!(SENT.lock().unwrap().is_empty());
         }
 
         fn resuming_claude_pane() -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
             let (mut app, rx) = claude_pane(b"", AgentState::Idle);
             let terminal_id = root_terminal(&app);
-            app.state.terminals.get_mut(&terminal_id).unwrap().agent_resume_started_at =
-                Some(std::time::Instant::now());
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .agent_resume_started_at = Some(std::time::Instant::now());
             (app, rx)
         }
 
@@ -940,7 +1281,10 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("the prompt answers once the session is up");
             let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-            assert!(matches!(success.result, ResponseResult::AgentPrompted { .. }), "{response}");
+            assert!(
+                matches!(success.result, ResponseResult::AgentPrompted { .. }),
+                "{response}"
+            );
         }
 
         // A resumed Claude Code writes its session record and messaging key only once it is up: a prompt sent to it before
@@ -954,14 +1298,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(600));
             assert!(response.try_recv().is_err(), "the session is not up yet");
 
-            let pane_id = app.public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane).unwrap();
+            let pane_id = app
+                .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+                .unwrap();
             let get = app.handle_api_request(crate::api::schema::Request {
                 id: "get".into(),
                 method: crate::api::schema::Method::PaneGet(crate::api::schema::PaneTarget {
                     pane_id,
                 }),
             });
-            assert!(serde_json::from_str::<SuccessResponse>(&get).is_ok(), "{get}");
+            assert!(
+                serde_json::from_str::<SuccessResponse>(&get).is_ok(),
+                "{get}"
+            );
             assert!(response.try_recv().is_err(), "the prompt still waits");
 
             write_session(&fixture.dir);
@@ -992,10 +1341,17 @@ mod tests {
             assert!(WAITER_THREADS_STARTED.load(Ordering::Relaxed) - threads <= 1);
             let (polls_after, reads_after) = *WAITER_POLLS_AND_READS.lock().unwrap();
             assert!(polls_after - polls >= 3, "{} polls", polls_after - polls);
-            assert_eq!(reads_after - reads, polls_after - polls, "one folder read a poll");
+            assert_eq!(
+                reads_after - reads,
+                polls_after - polls,
+                "one folder read a poll"
+            );
             let sent = SENT.lock().unwrap();
             assert_eq!(sent.len(), 2);
-            assert!(sent[0].1.contains("first") && sent[1].1.contains("second"), "{sent:?}");
+            assert!(
+                sent[0].1.contains("first") && sent[1].1.contains("second"),
+                "{sent:?}"
+            );
         }
     }
 
@@ -1022,17 +1378,91 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&refused).unwrap();
         assert_eq!(error.error.code, "agent_input_busy");
         assert!(
-            tokio::time::timeout(AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(100),
+                rx.recv()
+            )
+            .await
+            .is_err(),
             "text was typed into the focused pane"
         );
 
         app.state.active = None;
         let accepted = run_deferred_agent_prompt(&mut app, "req", params());
         let success: SuccessResponse = serde_json::from_str(&accepted).unwrap();
-        assert!(matches!(success.result, ResponseResult::AgentPrompted { .. }), "{accepted}");
+        assert!(
+            matches!(success.result, ResponseResult::AgentPrompted { .. }),
+            "{accepted}"
+        );
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B"));
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_waiter_spawn_failure_fails_before_submitting() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_prompt_failed");
+        std::thread::sleep(AGENT_PROMPT_SUBMIT_DELAY * 2);
+        assert!(rx.try_recv().is_err(), "a failed prompt must not be sent");
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_validation_errors_win_over_waiter_spawn_failure() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        for (target, text, code) in [
+            ("reviewer", "", "empty_agent_prompt"),
+            ("missing", "hello", "agent_not_found"),
+        ] {
+            crate::thread_spawn::test_hook::fail_next_spawns(1);
+            let response = run_deferred_agent_prompt(
+                &mut app,
+                "req",
+                AgentPromptParams {
+                    target: target.into(),
+                    text: text.into(),
+                    wait: None,
+                },
+            );
+
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, code);
+            assert!(
+                crate::thread_spawn::spawn_named("probe", || {}).is_err(),
+                "a rejected prompt must not start a waiter thread"
+            );
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -52,20 +53,17 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
     }
     let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
-    // The data is durable before the rename publishes it: a power loss after an unflushed rename
-    // leaves a zero-filled session file.
-    let result = (|| {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        std::io::Write::write_all(&mut file, json.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        crate::platform::replace_file(&tmp_path, &target)?;
-        crate::platform::sync_parent_directory(target.parent().unwrap_or_else(|| Path::new(".")))
-    })();
-    if result.is_err() {
+    let mut temporary = std::fs::File::create(&tmp_path)?;
+    // A rename can survive a hard crash before unflushed file contents reach disk.
+    let result = temporary
+        .write_all(json.as_bytes())
+        .and_then(|()| temporary.sync_all());
+    drop(temporary);
+    if let Err(err) = result.and_then(|()| crate::platform::replace_file(&tmp_path, &target)) {
         let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
     }
-    result
+    crate::platform::sync_parent_directory(target.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 pub(super) fn save_history_to_path(
@@ -287,6 +285,52 @@ mod tests {
         assert!(history.contains("split-secret"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn failed_replacement_preserves_saved_files_and_retries() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (session_path, history_path) = temp_session_paths("failed-replacement");
+        save_to_path(&session_path, &empty_snapshot()).unwrap();
+        save_history_to_path(&history_path, Some(&history_snapshot("old history"))).unwrap();
+
+        for path in [&session_path, &history_path] {
+            let original = std::fs::read(path).unwrap();
+            let locked = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+                .open(path)
+                .unwrap();
+            let mut changed = empty_snapshot();
+            changed.selected = 7;
+            let save = || {
+                if path == &session_path {
+                    save_to_path(path, &changed)
+                } else {
+                    save_history_to_path(path, Some(&history_snapshot("new history")))
+                }
+            };
+            assert!(save().is_err());
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            assert!(!path.with_extension("json.tmp").exists());
+
+            drop(locked);
+            save().unwrap();
+            assert!(!path.with_extension("json.tmp").exists());
+        }
+
+        assert_eq!(
+            parse_snapshot(&std::fs::read_to_string(&session_path).unwrap())
+                .unwrap()
+                .selected,
+            7
+        );
+        let history = std::fs::read_to_string(&history_path).unwrap();
+        assert!(history.contains("new history"));
+        assert!(!history.contains("old history"));
+        std::fs::remove_dir_all(session_path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn save_to_paths_removes_stale_history_when_history_is_disabled() {
         let (session_path, history_path) = temp_session_paths("clear-history");
@@ -325,8 +369,18 @@ mod tests {
         older.sidebar_width = Some(1);
         let mut newest = fixture_snapshot();
         newest.sidebar_width = Some(2);
-        write_recovery_copy(&path, "session-snapshots", 10, &serde_json::to_vec(&older).unwrap());
-        write_recovery_copy(&path, "session-snapshots", 20, &serde_json::to_vec(&newest).unwrap());
+        write_recovery_copy(
+            &path,
+            "session-snapshots",
+            10,
+            &serde_json::to_vec(&older).unwrap(),
+        );
+        write_recovery_copy(
+            &path,
+            "session-snapshots",
+            20,
+            &serde_json::to_vec(&newest).unwrap(),
+        );
         // A torn backup newer than both is skipped.
         write_recovery_copy(&path, "session-backups", 30, &[0u8; 512]);
 
@@ -343,16 +397,36 @@ mod tests {
         std::fs::write(&path, b"{\"version\":").unwrap();
         let mut full = fixture_snapshot();
         full.sidebar_width = Some(3);
-        write_recovery_copy(&path, "session-snapshots", 10, &serde_json::to_vec(&full).unwrap());
-        write_recovery_copy(&path, "session-backups", 20, &serde_json::to_vec(&empty_snapshot()).unwrap());
+        write_recovery_copy(
+            &path,
+            "session-snapshots",
+            10,
+            &serde_json::to_vec(&full).unwrap(),
+        );
+        write_recovery_copy(
+            &path,
+            "session-backups",
+            20,
+            &serde_json::to_vec(&empty_snapshot()).unwrap(),
+        );
 
-        assert_eq!(load_from_path(&path).expect("recovered session").sidebar_width, Some(3));
+        assert_eq!(
+            load_from_path(&path)
+                .expect("recovered session")
+                .sidebar_width,
+            Some(3)
+        );
     }
 
     #[test]
     fn missing_session_is_not_recovered() {
         let path = temp_session_path("missing-with-copies");
-        write_recovery_copy(&path, "session-snapshots", 10, &serde_json::to_vec(&fixture_snapshot()).unwrap());
+        write_recovery_copy(
+            &path,
+            "session-snapshots",
+            10,
+            &serde_json::to_vec(&fixture_snapshot()).unwrap(),
+        );
 
         assert!(load_from_path(&path).is_none());
     }

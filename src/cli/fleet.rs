@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::api::schema::{
-    AgentPromptParams, AgentStatus, AgentWaitParams, EmptyParams, Method, Request,
-};
+use crate::api::schema::{AgentPromptParams, AgentWaitParams, EmptyParams, Method, Request};
 
 const BRIEF_NAME_WIDTH: usize = 40;
 
@@ -288,24 +286,12 @@ fn current_sessions() -> Vec<ChatSession> {
 }
 
 /// `herdr agent list` prints the same JSON as ever; `--brief` prints one short line per agent instead.
-pub(super) fn agent_list(args: &[String]) -> std::io::Result<i32> {
-    let mut brief = false;
-    for arg in args {
-        match arg.as_str() {
-            "--brief" => brief = true,
-            "--full" => brief = false,
-            other => {
-                eprintln!("unknown option: {other}
-usage: herdr agent list [--brief|--full]");
-                return Ok(2);
-            }
-        }
-    }
+pub(super) fn agent_list_brief() -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:agent:list".into(),
         method: Method::AgentList(EmptyParams::default()),
     })?;
-    if !brief || response.get("error").is_some() {
+    if response.get("error").is_some() {
         return super::print_response(&response);
     }
     for row in parse_agent_rows(&response) {
@@ -437,72 +423,14 @@ pub(super) fn run_broadcast_command(args: &[String]) -> std::io::Result<i32> {
 ///
 /// With one target and no `--brief` this prints the single `agent.wait` JSON as before. Otherwise every target waits on
 /// its own thread and the first to reach a status prints one line: `<pane> <status> <name>`.
-pub(super) fn agent_wait(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str =
-        "usage: herdr agent wait <target>... [--any-of STATUS,STATUS | --until STATUS]... [--timeout MS] [--brief]";
-    let mut targets: Vec<String> = Vec::new();
-    let mut until: Vec<AgentStatus> = Vec::new();
-    let mut timeout_ms = None;
-    let mut brief = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--until" | "--any-of" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("{} requires a status\n{USAGE}", args[index]);
-                    return Ok(2);
-                };
-                for status in value.split(',').filter(|status| !status.is_empty()) {
-                    match super::parse_agent_status(status) {
-                        Ok(status) => until.push(status),
-                        Err(err) => {
-                            eprintln!("{err}");
-                            return Ok(2);
-                        }
-                    }
-                }
-                index += 2;
-            }
-            "--timeout" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --timeout\n{USAGE}");
-                    return Ok(2);
-                };
-                match super::parse_u64_flag("--timeout", value) {
-                    Ok(value) => timeout_ms = Some(value),
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return Ok(2);
-                    }
-                }
-                index += 2;
-            }
-            "--brief" => {
-                brief = true;
-                index += 1;
-            }
-            "--full" => {
-                brief = false;
-                index += 1;
-            }
-            "help" | "--help" | "-h" => {
-                eprintln!("{USAGE}");
-                return Ok(0);
-            }
-            value if value.starts_with("--") => {
-                eprintln!("unknown option: {value}\n{USAGE}");
-                return Ok(2);
-            }
-            value => {
-                targets.push(value.to_owned());
-                index += 1;
-            }
-        }
-    }
-    if targets.is_empty() {
-        eprintln!("{USAGE}");
-        return Ok(2);
-    }
+pub(super) fn agent_wait(
+    targets: Vec<String>,
+    params: AgentWaitParams,
+    brief: bool,
+) -> std::io::Result<i32> {
+    let AgentWaitParams {
+        until, timeout_ms, ..
+    } = params;
     let (sender, receiver) = mpsc::channel();
     for target in targets.iter().cloned() {
         let sender = sender.clone();
@@ -580,7 +508,10 @@ mod tests {
 
     #[test]
     fn worktree_comes_from_the_lorefs_path() {
-        assert_eq!(worktree_of("G:\\lorefs\\worktrees\\mp-floor\\BET"), "mp-floor");
+        assert_eq!(
+            worktree_of("G:\\lorefs\\worktrees\\mp-floor\\BET"),
+            "mp-floor"
+        );
         assert_eq!(worktree_of("G:\\BET\\blake_trws_blake_main\\BET"), "main");
     }
 
@@ -600,7 +531,10 @@ mod tests {
         let hits = resolve_query("BET-A8", &rows, &sessions);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].pane_id, "w1:p4");
-        assert_eq!(resolve_query("aaaaaaaa", &rows, &sessions)[0].pane_id, "w1:p4");
+        assert_eq!(
+            resolve_query("aaaaaaaa", &rows, &sessions)[0].pane_id,
+            "w1:p4"
+        );
     }
 
     #[test]
@@ -637,8 +571,14 @@ mod tests {
             targets,
             vec![
                 Target::Pane("w1:p4".into()),
-                Target::Unresolved { query: "ps5-gpu".into(), reason: "ambiguous" },
-                Target::Unresolved { query: "nothing".into(), reason: "not_found" },
+                Target::Unresolved {
+                    query: "ps5-gpu".into(),
+                    reason: "ambiguous"
+                },
+                Target::Unresolved {
+                    query: "nothing".into(),
+                    reason: "not_found"
+                },
             ]
         );
     }

@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::api::schema::InstalledPluginInfo;
+use crate::plugin_installations::{self, Leases};
+
+type LoadedRegistry = (Vec<InstalledPluginInfo>, Leases);
 
 /// A load starts at most this often, however many events ask for one. A registry change made by the CLI is seen by the hooks of
 /// the first event after the load that follows it.
@@ -19,7 +22,7 @@ struct Shared {
     last_started: Option<Instant>,
     /// Bumped when the loop reads or writes the registry itself: a load that began before is stale and is dropped.
     epoch: u64,
-    ready: Option<Vec<InstalledPluginInfo>>,
+    ready: Option<LoadedRegistry>,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -68,7 +71,7 @@ impl PluginRegistryRefresh {
     }
 
     /// Takes the registry the last finished load produced, if the loop has not read or written the registry itself since it began.
-    pub(crate) fn take_ready(&self) -> Option<Vec<InstalledPluginInfo>> {
+    pub(crate) fn take_ready(&self) -> Option<LoadedRegistry> {
         lock(&self.shared).ready.take()
     }
 
@@ -92,12 +95,11 @@ impl PluginRegistryRefresh {
     }
 }
 
-fn load_registry() -> std::io::Result<Vec<InstalledPluginInfo>> {
-    let entries = crate::persist::plugin_registry::try_load()?;
-    Ok(crate::persist::plugin_registry::reload_manifests(
-        entries,
-        |path, enabled| {
-            super::load_plugin_manifest(path, enabled).map_err(|(_, message)| message)
-        },
-    ))
+fn load_registry() -> std::io::Result<LoadedRegistry> {
+    let mut leases = Leases::new();
+    let entries = plugin_installations::load(&mut leases)?;
+    let entries = crate::persist::plugin_registry::reload_manifests(entries, |path, enabled| {
+        super::load_plugin_manifest(path, enabled).map_err(|(_, message)| message)
+    });
+    Ok((entries, leases))
 }
