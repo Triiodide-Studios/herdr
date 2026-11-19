@@ -2072,9 +2072,8 @@ fn process_is_ancestor(ancestor_pid: u32, descendant_pid: u32, snapshot: &Proces
     false
 }
 
-/// `root_pid`'s descendants other than those under `selected_pid`. A process that starts or ends under the agent in front (its tool
-/// calls, its MCP servers) cannot change which agent is in front, so the foreground selection cache neither records nor checks it
-/// (BET-9635).
+/// Tracks the pane shell's descendants, excluding children of the selected agent.
+/// While the shell itself is selected, a new child can take the foreground.
 fn descendant_entries_outside(
     root_pid: u32,
     selected_pid: u32,
@@ -2082,7 +2081,9 @@ fn descendant_entries_outside(
 ) -> Vec<&WindowsProcessEntry> {
     descendant_entries(root_pid, snapshot)
         .into_iter()
-        .filter(|entry| !process_is_ancestor(selected_pid, entry.pid, snapshot))
+        .filter(|entry| {
+            root_pid == selected_pid || !process_is_ancestor(selected_pid, entry.pid, snapshot)
+        })
         .collect()
 }
 
