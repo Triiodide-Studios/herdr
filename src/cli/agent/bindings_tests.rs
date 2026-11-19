@@ -120,6 +120,38 @@ fn agent_projection_nested_wait_omission_and_repeated_statuses() {
 }
 
 #[test]
+fn agent_projection_fleet_wait_preserves_targets_and_parses_options() {
+    let operation = parse(&[
+        "wait",
+        "first",
+        "second",
+        "--any-of=waiting,idle",
+        "--timeout",
+        "10",
+        "--brief",
+    ])
+    .unwrap();
+    let Operation::FleetWait {
+        targets,
+        params,
+        brief,
+    } = operation
+    else {
+        panic!("expected fleet wait");
+    };
+    assert_eq!(targets, ["first", "second"]);
+    assert_eq!(
+        params.until,
+        [
+            crate::api::schema::AgentStatus::Waiting,
+            crate::api::schema::AgentStatus::Idle
+        ]
+    );
+    assert_eq!(params.timeout_ms, Some(10));
+    assert!(brief);
+}
+
+#[test]
 fn agent_projection_raw_vectors_and_start_defaults() {
     assert_eq!(
         params(&["send-keys", "opaque", "esc", "--literal", "two words", ""]),

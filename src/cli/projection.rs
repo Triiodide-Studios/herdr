@@ -481,10 +481,16 @@ pub(crate) fn assert_choices_cover_api_enum<T: serde::Serialize + schemars::Json
 ) {
     use std::collections::BTreeSet;
     let schema = serde_json::to_value(schemars::schema_for!(T)).expect("enum schema");
-    let api: BTreeSet<String> = schema["enum"]
+    let variants = schema["oneOf"]
         .as_array()
-        .expect("unit enum schema")
+        .map_or(std::slice::from_ref(&schema), Vec::as_slice);
+    let api: BTreeSet<String> = variants
         .iter()
+        .flat_map(|variant| {
+            variant["enum"]
+                .as_array()
+                .map_or(std::slice::from_ref(&variant["const"]), Vec::as_slice)
+        })
         .map(|value| value.as_str().expect("string enum value").to_owned())
         .collect();
     let cli: BTreeSet<String> = table

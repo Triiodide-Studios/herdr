@@ -282,7 +282,7 @@ pub(crate) fn command() -> Command {
             .override_usage("herdr agent rename <TARGET> <NAME>|--clear")
             .group(ArgGroup::new("rename").args(["name", "clear"]).required(true)))
         .subcommand(leaf("wait", AgentWaitProjection::arguments(), "Wait until an agent reaches one of the requested states")
-            .mut_arg("target", |arg| arg.num_args(1..))
+            .mut_arg("target", |arg| arg.num_args(1..).allow_hyphen_values(false))
             .mut_arg("until", |arg| arg.visible_alias("any-of").value_delimiter(','))
             .arg(brief_flag())
             .arg(full_flag())

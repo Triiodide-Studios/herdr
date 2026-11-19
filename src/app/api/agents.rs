@@ -1409,6 +1409,7 @@ mod tests {
         terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.state.insert_test_runtime(pane_id, runtime);
+        app.state.active = None;
 
         crate::thread_spawn::test_hook::fail_next_spawns(1);
         let response = run_deferred_agent_prompt(
