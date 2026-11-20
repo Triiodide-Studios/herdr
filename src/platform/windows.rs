@@ -356,7 +356,8 @@ use windows_sys::{
                 OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
                 TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
                 PROCESS_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, THREAD_SUSPEND_RESUME,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
+                THREAD_SUSPEND_RESUME,
             },
         },
         UI::{
@@ -2418,7 +2419,7 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
     }
 
     for &pid in pids {
-        let Some(process) = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        let Some(process) = ProcessHandle::open(pid, PROCESS_TERMINATE) else {
             continue;
         };
         unsafe {
@@ -3790,6 +3791,38 @@ mod tests {
         let _ = child.wait();
 
         assert_eq!(observed.as_deref(), Some("pane-test"));
+    }
+
+    #[test]
+    fn windows_terminate_signal_exits_the_child_process() {
+        let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut child = Command::new(powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a PowerShell process");
+
+        super::signal_processes(&[child.id()], super::Signal::Terminate);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let result = loop {
+            match child.try_wait() {
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                result => break result,
+            }
+        };
+        if !matches!(result, Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(result.unwrap().and_then(|status| status.code()), Some(1));
     }
 
     #[test]
