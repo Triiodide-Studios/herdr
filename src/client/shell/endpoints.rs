@@ -724,6 +724,19 @@ pub(super) fn endpoint_status_presentation(
     }
 }
 
+/// The endpoints the shell shows. Local is always first in the catalog, so "this machine only"
+/// is its first entry; remote endpoints stay connected but are hidden from sidebar and navigation.
+pub(super) fn visible_endpoints(
+    endpoints: &[ClientShellEndpoint],
+    local_only: bool,
+) -> &[ClientShellEndpoint] {
+    if local_only {
+        &endpoints[..endpoints.len().min(1)]
+    } else {
+        endpoints
+    }
+}
+
 pub(super) fn local_endpoint() -> ClientShellEndpoint {
     ClientShellEndpoint {
         endpoint_id: ClientEndpointId::Local,

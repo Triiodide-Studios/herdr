@@ -14,6 +14,13 @@ pub(super) struct ClientRemoteCollapsedGroups {
     pub(super) collapsed_groups: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ClientRemotePinnedAgents {
+    pub(super) profile_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) pinned_agents: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct ClientChromePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,17 +37,34 @@ pub(super) struct ClientChromePreferences {
     pub(super) remote_collapsed_groups: Vec<ClientRemoteCollapsedGroups>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) pinned_agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) remote_pinned_agents: Vec<ClientRemotePinnedAgents>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) local_only: bool,
 }
 
 pub(super) fn path_for_local_endpoint(socket_path: &Path) -> PathBuf {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in socket_path.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    let hash = fnv1a(&socket_path.to_string_lossy());
     crate::config::state_dir()
         .join("client-shell")
         .join(format!("local-{hash:016x}.json"))
+}
+
+/// The chrome preferences of `herdr --remote <target>` for one session; `key` is
+/// "<target>\n<session>".
+pub(crate) fn path_for_remote_attach(key: &str) -> PathBuf {
+    crate::config::state_dir()
+        .join("client-shell")
+        .join(format!("remote-attach-{:016x}.json", fnv1a(key)))
+}
+
+fn fnv1a(text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// The agents pinned in the sidebar of the local client of `socket_path`, by public pane id: a server restoring a session
@@ -85,6 +109,13 @@ mod tests {
 
     #[test]
     fn endpoint_paths_are_stable_and_distinct() {
+        let attach = path_for_remote_attach("trws-blake\ndefault");
+        assert_eq!(attach, path_for_remote_attach("trws-blake\ndefault"));
+        assert_ne!(attach, path_for_remote_attach("trws-blake\nother"));
+        assert!(attach
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("remote-attach-")));
         let first = path_for_local_endpoint(Path::new("/run/herdr/one.sock"));
         let again = path_for_local_endpoint(Path::new("/run/herdr/one.sock"));
         let second = path_for_local_endpoint(Path::new("/run/herdr/two.sock"));

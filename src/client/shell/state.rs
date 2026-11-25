@@ -26,6 +26,8 @@ pub(crate) struct ClientShellConfig {
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     /// Local agent panes pinned to the top of the agents panel, oldest pin first.
     pub(super) pinned_agents: Vec<String>,
+    /// Saved machines' agent panes pinned in the all-machines agents panel, oldest pin first.
+    pub(super) remote_pinned_agents: HashMap<ClientEndpointId, Vec<String>>,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
     pub(super) sound_enabled: bool,
     pub(super) toast_delivery: crate::config::ToastDelivery,
@@ -566,11 +568,16 @@ pub(super) enum ClientContextMenuTarget {
         right_click_passthrough: bool,
     },
     Agent {
+        /// The machine the agent runs on: pins are kept per machine.
+        endpoint_id: ClientEndpointId,
         pane_id: String,
         has_manual_label: bool,
         pinned: bool,
         /// The chat id comes from the local server's socket API, so it is offered on the local endpoint only.
         local: bool,
+        /// An agent on a machine other than the active one: requests go to the active machine, so
+        /// only the pin, which the client keeps itself, is offered.
+        pin_only: bool,
     },
     AgentPanel {
         workspace_id: String,
@@ -915,6 +922,8 @@ pub(crate) struct ClientShellState {
     pub(super) endpoints: Vec<ClientShellEndpoint>,
     pub(super) active_endpoint_id: ClientEndpointId,
     pub(super) collapsed_endpoints: HashSet<ClientEndpointId>,
+    /// Show only this machine; saved remote machines stay connected but hidden.
+    pub(super) local_only: bool,
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<WorkspaceNavigationTarget>,
     pub(super) pending_workspace_highlight: Option<PendingWorkspaceHighlight>,
@@ -1028,6 +1037,18 @@ impl ClientShellState {
             config.agent_panel_sort = sort;
         }
         config.pinned_agents = preferences.pinned_agents.clone();
+        for saved in &preferences.remote_pinned_agents {
+            let Ok(profile_id) =
+                crate::client::endpoint::ProfileId::parse(saved.profile_id.clone())
+            else {
+                continue;
+            };
+            config
+                .remote_pinned_agents
+                .entry(ClientEndpointId::Ssh(profile_id))
+                .or_default()
+                .extend(saved.pinned_agents.iter().cloned());
+        }
         let chat_search = super::chat_search_box::ChatSearchState::new(config.chat_search.clone());
         let mut remote_collapsed_groups = HashMap::<ClientEndpointId, HashSet<String>>::new();
         for saved in preferences.remote_collapsed_groups {
@@ -1083,6 +1104,7 @@ impl ClientShellState {
             endpoints: vec![local_endpoint()],
             active_endpoint_id: ClientEndpointId::Local,
             collapsed_endpoints: HashSet::new(),
+            local_only: preferences.local_only,
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
             pending_workspace_highlight: None,

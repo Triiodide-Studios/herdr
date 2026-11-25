@@ -16,7 +16,7 @@ mod indexer;
 mod keywords;
 mod transcript;
 
-pub(crate) use index::{ChatHit, ChatSearchIndex, IndexSnapshot, IndexStatus};
+pub(crate) use index::{ChatHit, ChatSearchIndex, ChatText, IndexSnapshot, IndexStatus};
 
 #[cfg(test)]
 pub(in crate::client) use index::test_support;

@@ -48,6 +48,21 @@ impl ClientShellState {
             })
             .collect::<Vec<_>>();
         remote_collapsed_groups.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+        let mut remote_pinned_agents = self
+            .config
+            .remote_pinned_agents
+            .iter()
+            .filter_map(|(endpoint_id, pinned_agents)| {
+                let ClientEndpointId::Ssh(profile_id) = endpoint_id else {
+                    return None;
+                };
+                (!pinned_agents.is_empty()).then(|| preferences::ClientRemotePinnedAgents {
+                    profile_id: profile_id.to_string(),
+                    pinned_agents: pinned_agents.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        remote_pinned_agents.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
         let preferences = preferences::ClientChromePreferences {
             sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
             sidebar_section_split: self
@@ -62,6 +77,8 @@ impl ClientShellState {
             collapsed_groups,
             remote_collapsed_groups,
             pinned_agents: self.config.pinned_agents.clone(),
+            remote_pinned_agents,
+            local_only: self.local_only,
         };
         if let Err(error) = preferences::store(path, preferences) {
             self.set_endpoint_error(error);
@@ -126,6 +143,7 @@ impl ClientShellConfig {
             agents: config.ui.sidebar.agents.clone(),
             agent_panel_sort: config.ui.agent_panel_sort,
             pinned_agents: Vec::new(),
+            remote_pinned_agents: HashMap::new(),
             status_indicators: config.ui.status_indicators,
             sound_enabled: config.ui.sound.enabled,
             toast_delivery: config.ui.toast.delivery,
@@ -203,6 +221,15 @@ impl ClientShellConfig {
 
     pub(crate) fn with_local_endpoint(self, socket_path: &std::path::Path) -> Self {
         self.with_preferences_path(preferences::path_for_local_endpoint(socket_path))
+    }
+
+    /// A `--remote` client keeps its chrome preferences per machine and session, not per
+    /// forwarded socket: that path holds the attaching process's id.
+    pub(crate) fn with_remote_preferences(self, key: Option<String>) -> Self {
+        match key {
+            Some(key) => self.with_preferences_path(preferences::path_for_remote_attach(&key)),
+            None => self,
+        }
     }
 
     pub(super) fn with_preferences_path(mut self, path: std::path::PathBuf) -> Self {
@@ -548,5 +575,31 @@ mod tests {
             shell.keybinds.prefix,
             vec![(KeyCode::Char('x'), KeyModifiers::CONTROL)]
         );
+    }
+}
+
+impl ClientShellConfig {
+    /// The agent panes pinned on `endpoint_id`, oldest pin first.
+    pub(super) fn pinned_agents_for(&self, endpoint_id: &ClientEndpointId) -> &[String] {
+        if endpoint_id.is_local() {
+            &self.pinned_agents
+        } else {
+            self.remote_pinned_agents
+                .get(endpoint_id)
+                .map_or(&[], Vec::as_slice)
+        }
+    }
+
+    pub(super) fn pinned_agents_for_mut(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+    ) -> &mut Vec<String> {
+        if endpoint_id.is_local() {
+            &mut self.pinned_agents
+        } else {
+            self.remote_pinned_agents
+                .entry(endpoint_id.clone())
+                .or_default()
+        }
     }
 }

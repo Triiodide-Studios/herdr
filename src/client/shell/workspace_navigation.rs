@@ -101,7 +101,7 @@ impl ClientShellState {
         let surface_available = self.snapshot.is_some() && self.pane_surface.is_some();
         let empty_collapsed_groups = HashSet::new();
         let mut targets = Vec::new();
-        for endpoint in &self.endpoints {
+        for endpoint in super::endpoints::visible_endpoints(&self.endpoints, self.local_only) {
             if endpoint.status != ClientEndpointStatus::Online {
                 continue;
             }
@@ -154,7 +154,9 @@ impl ClientShellState {
         };
         let target = targets.swap_remove(next);
         self.collapsed_endpoints.remove(&target.endpoint_id);
-        if self.endpoints.len() == 1 && !mobile {
+        if super::endpoints::visible_endpoints(&self.endpoints, self.local_only).len() == 1
+            && !mobile
+        {
             self.reveal_workspace(&target.workspace_id);
         }
         self.navigate_workspace_id = Some(target);

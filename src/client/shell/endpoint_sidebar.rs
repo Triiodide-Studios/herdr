@@ -553,16 +553,41 @@ pub(super) fn render_expanded(
             }),
         );
     }
+    // The chat search covers every listed machine: this one by its transcripts, the others by
+    // their chats' names and titles. It shows while this machine is listed.
+    let local_agents = state
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.endpoint_id.is_local())
+        .and_then(|endpoint| endpoint.snapshot.as_deref())
+        .map(|_| {
+            state
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint.snapshot.as_deref())
+                .map(|snapshot| snapshot.agents.len())
+                .sum::<usize>()
+        });
+    let (search_area, agent_area) = match local_agents {
+        Some(_) => super::chat_search_box::split_detail_area(detail_area),
+        None => (Rect::default(), detail_area),
+    };
+    super::chat_search_box::render_section(buffer, search_area, state.chat_search, config, hits);
+    let filter = local_agents
+        .filter(|_| !search_area.is_empty())
+        .and_then(|open_chats| state.chat_search.agent_filter(open_chats));
     super::endpoint_agents::render_expanded(
         buffer,
-        detail_area,
+        agent_area,
         active_snapshot.and_then(|snapshot| snapshot.agent_view_label.as_deref()),
         state.endpoints,
         state.active_endpoint_id,
         config,
         state.agent_scroll,
+        filter.as_ref(),
         hits,
     );
+    state.chat_search.reveal_done();
     hits.sidebar_toggle = Rect::new(
         area.right().saturating_sub(2),
         area.bottom().saturating_sub(1),

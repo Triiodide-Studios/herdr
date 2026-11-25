@@ -9,7 +9,10 @@ use ratatui::style::Color;
 use super::agent_sidebar::AgentFilter;
 use super::render::{display_width, put_right_text, put_text};
 use super::*;
-use crate::client::chat_search::{ChatHit, ChatSearchIndex, IndexSnapshot, IndexStatus};
+use crate::client::chat_search::{ChatHit, ChatSearchIndex, ChatText, IndexSnapshot, IndexStatus};
+
+/// A chat the search found: the machine it runs on and its pane.
+pub(super) type ChatTarget = (ClientEndpointId, String);
 
 const PROMPT: &str = " / ";
 const PLACEHOLDER: &str = "find a chat";
@@ -32,7 +35,7 @@ pub(super) struct ChatSearchState {
     ranked: Vec<ChatHit>,
     ranked_for: Option<(u64, String)>,
     /// The ranked chats that are still open, best first.
-    results: Vec<String>,
+    results: Vec<ChatTarget>,
     /// The highlight moved: the agents panel scrolls to it the next time it is drawn.
     reveal_selected: bool,
 }
@@ -44,7 +47,7 @@ pub(super) enum ChatSearchKey {
     /// The query or the highlight changed.
     Changed,
     /// Go to this chat.
-    Activate(String),
+    Activate(ChatTarget),
     /// Leave the search.
     Close,
 }
@@ -148,9 +151,33 @@ impl ChatSearchState {
         ChatSearchKey::Changed
     }
 
-    /// Brings the results up to date with the index and with the chats that are open. Cheap enough
-    /// for every frame: the index is searched only when its generation or the query changed.
-    pub(super) fn refresh(&mut self, open: &ClientShellSnapshot) {
+    /// Brings the results up to date with the index and with the chats open on the listed
+    /// `machines`, and hands the index the chats it does not read itself: those of the saved
+    /// machines (and, in a `--remote` client, of the remote machine), by name and title. Cheap
+    /// enough for every frame: the index is searched only when its generation or the query changed.
+    pub(super) fn refresh(&mut self, machines: &[(&ClientEndpointId, &ClientShellSnapshot)]) {
+        let pushed = machines
+            .iter()
+            .filter(|(endpoint_id, _)| !(endpoint_id.is_local() && self.index.indexes_local()))
+            .flat_map(|(endpoint_id, snapshot)| {
+                snapshot.agents.iter().map(|agent| ChatText {
+                    endpoint_id: (*endpoint_id).clone(),
+                    pane_id: agent.pane_id.clone(),
+                    names: [&agent.display_agent, &agent.name]
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                        .collect(),
+                    title: agent
+                        .title
+                        .clone()
+                        .or_else(|| agent.terminal_title_stripped.clone())
+                        .unwrap_or_default(),
+                    keywords: Vec::new(),
+                })
+            })
+            .collect();
+        self.index.push_chats(pushed);
         self.snapshot = self.index.snapshot();
         let query = self.editor.trim();
         if query.is_empty() {
@@ -172,8 +199,16 @@ impl ChatSearchState {
         self.results = self
             .ranked
             .iter()
-            .filter(|hit| open.agents.iter().any(|agent| agent.pane_id == hit.pane_id))
-            .map(|hit| hit.pane_id.clone())
+            .filter(|hit| {
+                machines.iter().any(|(endpoint_id, snapshot)| {
+                    **endpoint_id == hit.endpoint_id
+                        && snapshot
+                            .agents
+                            .iter()
+                            .any(|agent| agent.pane_id == hit.pane_id)
+                })
+            })
+            .map(|hit| (hit.endpoint_id.clone(), hit.pane_id.clone()))
             .collect();
         self.selected = self.selected.min(self.results.len().saturating_sub(1));
     }
@@ -182,13 +217,12 @@ impl ChatSearchState {
     /// with the highlighted one marked once the box has the keyboard.
     pub(super) fn agent_filter(&self, open_chats: usize) -> Option<AgentFilter<'_>> {
         self.is_active().then(|| AgentFilter {
-            pane_ids: &self.results,
+            targets: &self.results,
             label: format!("{} of {open_chats}", self.results.len()),
             highlighted: self
                 .focused
                 .then(|| self.results.get(self.selected))
-                .flatten()
-                .map(String::as_str),
+                .flatten(),
             reveal_highlighted: self.reveal_selected,
             empty_message: match self.snapshot.status() {
                 IndexStatus::Starting => " indexing chats…",
@@ -203,23 +237,39 @@ impl ChatSearchState {
         self.reveal_selected = false;
     }
 
-    /// A short note on the search's own state, for the right of the heading.
+    /// A short note on the search's own state, for the right of the heading. Searching by
+    /// letters alone when the model is missing needs no note.
     fn notice(&self) -> Option<&'static str> {
         match self.snapshot.status() {
             IndexStatus::Starting => Some("indexing…"),
-            IndexStatus::ModelUnavailable(_) => Some("letters only"),
-            IndexStatus::Ready => None,
+            IndexStatus::ModelUnavailable(_) | IndexStatus::Ready => None,
         }
     }
 
+    /// The panes of the results, best first.
     #[cfg(test)]
-    pub(super) fn results(&self) -> &[String] {
+    pub(super) fn results(&self) -> Vec<&str> {
+        self.results
+            .iter()
+            .map(|(_, pane_id)| pane_id.as_str())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn index(&self) -> &ChatSearchIndex {
+        &self.index
+    }
+
+    #[cfg(test)]
+    pub(super) fn result_targets(&self) -> &[ChatTarget] {
         &self.results
     }
 
     #[cfg(test)]
     pub(super) fn selected_pane(&self) -> Option<&str> {
-        self.results.get(self.selected).map(String::as_str)
+        self.results
+            .get(self.selected)
+            .map(|(_, pane_id)| pane_id.as_str())
     }
 }
 
@@ -360,10 +410,12 @@ struct FieldColors {
 impl FieldColors {
     fn of(palette: &Palette) -> Self {
         let Color::Rgb(r, g, b) = palette.panel_bg else {
+            // Dark gray (ANSI 8), not gray (ANSI 7): most terminals draw gray close to white,
+            // and the placeholder must read as a hint. It still meets AA on the black fill.
             return Self {
                 fill: Color::Black,
                 text: Color::White,
-                hint: Color::Gray,
+                hint: Color::DarkGray,
             };
         };
         let light = (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b)) / 1000 > 128;
@@ -430,7 +482,7 @@ impl ClientShellState {
         match self.chat_search.handle_key(key) {
             ChatSearchKey::Ignored => {}
             ChatSearchKey::Changed => outcome.repaint = true,
-            ChatSearchKey::Activate(pane_id) => self.go_to_searched_chat(pane_id, outcome),
+            ChatSearchKey::Activate(target) => self.go_to_searched_chat(target, outcome),
             ChatSearchKey::Close => {
                 self.chat_search.clear();
                 outcome.repaint = true;
@@ -438,9 +490,26 @@ impl ClientShellState {
         }
     }
 
-    /// Ends the search, scrolls the full agents list to the chat, and focuses it.
-    fn go_to_searched_chat(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
+    /// Ends the search, scrolls the full agents list to the chat, and focuses it. With saved
+    /// machines listed, the chat's machine is made active first if it is not.
+    fn go_to_searched_chat(
+        &mut self,
+        (endpoint_id, pane_id): ChatTarget,
+        outcome: &mut ClientShellInput,
+    ) {
         self.chat_search.clear();
+        let all_machines =
+            super::endpoints::visible_endpoints(&self.endpoints, self.local_only).len() > 1;
+        if all_machines || endpoint_id != self.active_endpoint_id {
+            self.reveal_endpoint_agent(&endpoint_id, &pane_id, self.hits.agent_body.height);
+            self.focus_or_activate(
+                endpoint_id,
+                ClientEndpointFocusTarget::Pane(pane_id),
+                outcome,
+            );
+            outcome.repaint = true;
+            return;
+        }
         self.reveal_agent(&pane_id);
         self.push_endpoint_method(
             crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget { pane_id }),
@@ -500,11 +569,18 @@ impl ClientShellState {
                     .agents
                     .iter()
                     .find(|(rect, _)| super::contains(*rect, point))
-                    .map(|(_, pane_id)| pane_id.clone())
+                    .map(|(_, pane_id)| (self.active_endpoint_id.clone(), pane_id.clone()))
+                    .or_else(|| {
+                        self.hits
+                            .endpoint_agents
+                            .iter()
+                            .find(|(rect, _, _)| super::contains(*rect, point))
+                            .map(|(_, endpoint_id, pane_id)| (endpoint_id.clone(), pane_id.clone()))
+                    })
             })
             .flatten();
-        if let Some(pane_id) = chosen {
-            self.go_to_searched_chat(pane_id, outcome);
+        if let Some(target) = chosen {
+            self.go_to_searched_chat(target, outcome);
             return true;
         }
         if self.chat_search.is_focused() {
@@ -512,6 +588,11 @@ impl ClientShellState {
             outcome.repaint = true;
         }
         false
+    }
+
+    #[cfg(test)]
+    pub(super) fn chat_search_index_for_test(&self) -> &ChatSearchIndex {
+        self.chat_search.index()
     }
 
     /// Keys and text go to the box while it has the keyboard, in the terminal mode only.

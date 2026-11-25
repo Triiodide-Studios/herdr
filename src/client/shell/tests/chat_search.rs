@@ -1,7 +1,7 @@
 use ratatui::style::Color;
 
 use super::*;
-use crate::client::chat_search::{test_support, ChatSearchIndex};
+use crate::client::chat_search::{test_support, ChatSearchIndex, IndexSnapshot, IndexStatus};
 
 fn chat(pane_id: &str, display_agent: &str, title: &str) -> ClientShellAgent {
     ClientShellAgent {
@@ -585,5 +585,121 @@ fn the_spaces_section_can_be_dragged_down_to_four_rows_in_a_tall_window() {
     assert!(
         !state.hits.workspaces.is_empty(),
         "one space still fits above the footer"
+    );
+}
+
+fn remote_machine() -> crate::client::endpoint::SavedSshEndpoint {
+    crate::client::endpoint::SavedSshEndpoint {
+        id: crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        label: "Build".into(),
+        target: "dev@build.example".into(),
+        session: "agents".into(),
+        enabled: true,
+    }
+}
+
+/// This machine's chats plus a saved machine running `pane_9`, "forge", which the index knows
+/// by its name and title.
+fn state_with_remote_chat(index: ChatSearchIndex) -> (ClientShellState, ClientEndpointId) {
+    let mut state = searching_state(index);
+    let profile = remote_machine();
+    let remote_id = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(
+        &remote_id,
+        crate::client::endpoint::ClientEndpointStatus::Online,
+    );
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    remote.agents = vec![chat("pane_9", "forge", "Warm the shader cache")];
+    state.set_endpoint_snapshot(&remote_id, Box::new(remote));
+    state.compose(106, 30).expect("frame with both machines");
+    (state, remote_id)
+}
+
+fn remote_indexed(remote_id: &ClientEndpointId) -> ChatSearchIndex {
+    let mut forge = test_support::chat("pane_9", &["forge"], "Warm the shader cache", &[]);
+    forge.endpoint_id = remote_id.clone();
+    let mut local = test_support::chat("pane_9", &["solver"], "Shader of a different machine", &[]);
+    local.pane_id = "pane_1".into();
+    ChatSearchIndex::with_snapshot_indexing_local(test_support::snapshot(vec![local, forge]), true)
+}
+
+#[test]
+fn a_saved_machines_chats_are_found_and_opened_on_that_machine() {
+    let remote_id = ClientEndpointId::Ssh(remote_machine().id);
+    let (mut state, _) = state_with_remote_chat(remote_indexed(&remote_id));
+
+    let pushed = state.chat_search_index_for_test().pushed_chats();
+    assert_eq!(
+        pushed
+            .iter()
+            .map(|chat| (
+                &chat.endpoint_id,
+                chat.pane_id.as_str(),
+                chat.title.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [(&remote_id, "pane_9", "Warm the shader cache")],
+        "the saved machine's chats are handed to the index; this machine's are read by it"
+    );
+
+    search_for(&mut state, "warm");
+    assert_eq!(
+        state.chat_search.result_targets(),
+        [(remote_id.clone(), "pane_9".to_owned())]
+    );
+    let listed = state
+        .hits
+        .endpoint_agents
+        .iter()
+        .map(|(_, endpoint_id, pane_id)| (endpoint_id.clone(), pane_id.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(listed, [(remote_id.clone(), "pane_9".to_owned())]);
+
+    let outcome = key(&mut state, KeyCode::Enter);
+    assert!(
+        outcome.actions.iter().any(|action| matches!(
+            action,
+            ClientShellAction::ActivateEndpoint {
+                endpoint_id,
+                target: Some(ClientEndpointFocusTarget::Pane(pane_id)),
+            } if *endpoint_id == remote_id && pane_id == "pane_9"
+        )),
+        "{:?}",
+        outcome.actions
+    );
+    assert!(!state.chat_search.is_active());
+}
+
+#[test]
+fn a_remote_clients_chats_are_pushed_from_its_snapshot() {
+    let index = ChatSearchIndex::inert();
+    let state = searching_state(index);
+    let pushed = state.chat_search_index_for_test().pushed_chats();
+    assert_eq!(
+        pushed
+            .iter()
+            .map(|chat| (chat.endpoint_id.is_local(), chat.pane_id.as_str()))
+            .collect::<Vec<_>>(),
+        [(true, "pane_1"), (true, "pane_2"), (true, "pane_3")],
+        "an index that does not read this machine's server gets its chats from the snapshot"
+    );
+    assert_eq!(pushed[1].names, ["lumen"]);
+    assert_eq!(pushed[1].title, "Find why sunlight is blocked");
+}
+
+#[test]
+fn a_missing_model_needs_no_notice() {
+    let mut state = state_with(
+        ChatSearchIndex::with_snapshot(IndexSnapshot::empty(IndexStatus::ModelUnavailable(
+            "no model".into(),
+        ))),
+        open_chats(),
+    );
+    let rows = sidebar_rows(&mut state);
+    assert!(
+        rows.iter().all(|row| !row.contains("letters only")),
+        "{rows:#?}"
     );
 }

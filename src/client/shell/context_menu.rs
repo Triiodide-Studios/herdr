@@ -79,12 +79,14 @@ impl ClientContextMenuOverlay {
                 has_manual_label,
                 pinned,
                 local,
+                pin_only,
                 ..
             } => {
-                let mut items = vec![
-                    item(if *pinned { "Unpin" } else { "Pin" }, Action::TogglePin),
-                    item("Rename", Action::RenamePane),
-                ];
+                let pin = item(if *pinned { "Unpin" } else { "Pin" }, Action::TogglePin);
+                if *pin_only {
+                    return vec![pin];
+                }
+                let mut items = vec![pin, item("Rename", Action::RenamePane)];
                 if *has_manual_label {
                     items.push(item("Clear name", Action::ClearPaneName));
                 }
@@ -198,13 +200,61 @@ impl ClientShellState {
             .panes
             .iter()
             .any(|pane| pane.pane_id == pane_id && pane.label.is_some());
-        let pinned = self.config.pinned_agents.contains(&pane_id);
+        let endpoint_id = self.active_endpoint_id.clone();
+        let pinned = self
+            .config
+            .pinned_agents_for(&endpoint_id)
+            .contains(&pane_id);
         self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
             target: ClientContextMenuTarget::Agent {
+                local: endpoint_id.is_local(),
+                endpoint_id,
                 pane_id,
                 has_manual_label,
                 pinned,
-                local: self.active_endpoint_id.is_local(),
+                pin_only: false,
+            },
+            x,
+            y,
+            highlighted: 0,
+        }));
+    }
+
+    /// The menu for an agent row of the all-machines agents panel. An agent on the active machine
+    /// gets the full menu; one on another machine gets only Pin, since the rest are requests to
+    /// the active machine's server.
+    pub(super) fn open_endpoint_agent_context_menu(
+        &mut self,
+        endpoint_id: ClientEndpointId,
+        pane_id: String,
+        x: u16,
+        y: u16,
+    ) {
+        if endpoint_id == self.active_endpoint_id {
+            self.open_agent_context_menu(pane_id, x, y);
+            return;
+        }
+        let known = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .and_then(|endpoint| endpoint.snapshot.as_deref())
+            .is_some_and(|snapshot| snapshot.agents.iter().any(|agent| agent.pane_id == pane_id));
+        if !known {
+            return;
+        }
+        let pinned = self
+            .config
+            .pinned_agents_for(&endpoint_id)
+            .contains(&pane_id);
+        self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+            target: ClientContextMenuTarget::Agent {
+                local: endpoint_id.is_local(),
+                endpoint_id,
+                pane_id,
+                has_manual_label: false,
+                pinned,
+                pin_only: true,
             },
             x,
             y,
@@ -235,8 +285,13 @@ impl ClientShellState {
 
     /// Pins an agent pane to the top of the agents panel, or unpins it, and saves the pins with
     /// the rest of this endpoint's chrome preferences.
-    pub(super) fn toggle_agent_pin(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
-        let pinned = &mut self.config.pinned_agents;
+    pub(super) fn toggle_agent_pin(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        pane_id: String,
+        outcome: &mut ClientShellInput,
+    ) {
+        let pinned = self.config.pinned_agents_for_mut(endpoint_id);
         if let Some(index) = pinned.iter().position(|pinned| *pinned == pane_id) {
             pinned.remove(index);
         } else {
@@ -291,9 +346,11 @@ impl ClientShellState {
                 action,
                 outcome,
             ),
-            ClientContextMenuTarget::Agent { pane_id, .. } => {
-                self.activate_agent_context_action(pane_id, action, outcome)
-            }
+            ClientContextMenuTarget::Agent {
+                endpoint_id,
+                pane_id,
+                ..
+            } => self.activate_agent_context_action(endpoint_id, pane_id, action, outcome),
             ClientContextMenuTarget::AgentPanel { workspace_id } => {
                 if action == ClientContextMenuAction::NewChat {
                     outcome
@@ -307,15 +364,18 @@ impl ClientShellState {
 
     fn activate_agent_context_action(
         &mut self,
+        endpoint_id: ClientEndpointId,
         pane_id: String,
         action: ClientContextMenuAction,
         outcome: &mut ClientShellInput,
     ) {
         match action {
-            ClientContextMenuAction::TogglePin => self.toggle_agent_pin(pane_id, outcome),
+            ClientContextMenuAction::TogglePin => {
+                self.toggle_agent_pin(&endpoint_id, pane_id, outcome)
+            }
             ClientContextMenuAction::ClosePane => {
                 self.config
-                    .pinned_agents
+                    .pinned_agents_for_mut(&endpoint_id)
                     .retain(|pinned| *pinned != pane_id);
                 self.persist_chrome_preferences(outcome);
                 self.push_endpoint_method(

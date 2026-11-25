@@ -1,5 +1,8 @@
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
+/// The machine and session a `--remote` client shows. Its chrome preferences (pins, sort, sidebar
+/// size) are kept under this, since the forwarded socket path changes on every attach.
+pub(crate) const REMOTE_PREFERENCES_KEY_ENV_VAR: &str = "HERDR_REMOTE_PREFERENCES_KEY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteKeybindings {

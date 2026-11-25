@@ -50,10 +50,36 @@ pub(super) fn global_menu_items(
         "detach",
         ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Detach),
     ));
+    items.push((
+        "local only",
+        ClientGlobalMenuAction::Binding(crate::input::KeybindAction::ToggleLocalOnly),
+    ));
     items
 }
 
 impl ClientShellState {
+    /// Switch between showing only this machine and showing every saved machine. Remote
+    /// endpoints keep their connections; they are only hidden from the sidebar and navigation.
+    pub(super) fn toggle_local_only(&mut self, outcome: &mut ClientShellInput) {
+        self.local_only = !self.local_only;
+        if self.local_only && !self.active_endpoint_id.is_local() {
+            self.activate_endpoint(ClientEndpointId::Local, outcome);
+        }
+        if self.local_only {
+            self.navigate_workspace_id = self
+                .navigate_workspace_id
+                .take()
+                .filter(|target| target.endpoint_id.is_local());
+        }
+        self.agent_scroll = 0;
+        self.workspace_scroll = 0;
+        self.reveal_focused_workspace = true;
+        self.invalidate_pane_surface();
+        outcome.repaint = true;
+        outcome.resize = true;
+        self.persist_chrome_preferences(outcome);
+    }
+
     pub(super) fn toggle_global_menu(&mut self) {
         if matches!(self.overlay, Some(ClientShellOverlay::GlobalMenu(_))) {
             self.overlay = None;

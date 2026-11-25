@@ -281,7 +281,7 @@ fn agent_navigation_keeps_scroll_when_target_is_visible() {
     let targets = super::super::aggregate_navigation::online_agent_targets(
         &state.endpoints,
         &state.active_endpoint_id,
-        state.config.agent_panel_sort,
+        &state.config,
     );
     let index = targets
         .iter()
@@ -1471,10 +1471,11 @@ fn selected_position_sort_uses_public_tab_and_pane_numbers() {
     ];
     state.set_test_endpoint_agent_view(&ClientEndpointId::Local, Some(view));
 
+    state.config.agent_panel_sort = crate::config::AgentPanelSortConfig::Priority;
     let names = aggregate_navigation::aggregate_agent_rows(
         &state.endpoints,
         &state.active_endpoint_id,
-        crate::config::AgentPanelSortConfig::Priority,
+        &state.config,
     )
     .into_iter()
     .map(|row| row.agent.name.as_deref().expect("agent name"))
@@ -2590,4 +2591,204 @@ fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
             target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
         }] if activated == &endpoint_id && workspace_id == "ws_1"
     ));
+}
+
+#[test]
+fn local_only_toggle_hides_remote_machines_without_disconnecting_them() {
+    let (mut state, remote_id) = state_with_remote();
+    let frame_text = |state: &mut ClientShellState| {
+        let frame = state.compose(120, 40).expect("frame");
+        frame
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>()
+    };
+    let toggle = |state: &mut ClientShellState| {
+        let mut outcome = ClientShellInput::default();
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleLocalOnly),
+            &mut outcome,
+        );
+        outcome
+    };
+
+    assert!(frame_text(&mut state).contains("remote-workspace"));
+    assert!(state
+        .hits
+        .machines
+        .iter()
+        .any(|hit| hit.endpoint_id == remote_id));
+
+    let outcome = toggle(&mut state);
+    assert!(state.local_only);
+    assert!(outcome.repaint);
+    assert!(outcome.actions.is_empty(), "local is already active");
+    assert!(!frame_text(&mut state).contains("remote-workspace"));
+    assert!(state
+        .hits
+        .machines
+        .iter()
+        .all(|hit| hit.endpoint_id.is_local()));
+    assert_eq!(
+        state.endpoint_status(&remote_id),
+        Some(ClientEndpointStatus::Online),
+        "hiding a machine must not disconnect it"
+    );
+
+    toggle(&mut state);
+    assert!(!state.local_only);
+    assert!(frame_text(&mut state).contains("remote-workspace"));
+
+    state.active_endpoint_id = remote_id;
+    let outcome = toggle(&mut state);
+    assert!(outcome.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::ActivateEndpoint { endpoint_id, .. } if endpoint_id.is_local()
+    )));
+}
+
+#[test]
+fn pinned_agents_lead_the_all_machines_panel_and_its_navigation() {
+    let (mut state, remote) = state_with_scrollable_agents();
+    state.config.pinned_agents = vec!["pane_7".into()];
+    state
+        .config
+        .remote_pinned_agents
+        .insert(remote.clone(), vec!["pane_5".into(), "pane_3".into()]);
+    state.agent_scroll = 0;
+    state.compose(100, 28).unwrap();
+
+    let order = super::super::aggregate_navigation::online_agent_targets(
+        &state.endpoints,
+        &state.active_endpoint_id,
+        &state.config,
+    )
+    .into_iter()
+    .map(|target| (target.endpoint_id, target.pane_id))
+    .take(3)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        [
+            (ClientEndpointId::Local, "pane_7".to_owned()),
+            (remote.clone(), "pane_5".to_owned()),
+            (remote.clone(), "pane_3".to_owned()),
+        ]
+    );
+    let first_rows = state
+        .hits
+        .endpoint_agents
+        .iter()
+        .take(3)
+        .map(|(_, endpoint_id, pane_id)| (endpoint_id.clone(), pane_id.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(first_rows, order);
+}
+
+#[test]
+fn right_clicking_another_machines_agent_offers_only_pin_and_pins_it_on_that_machine() {
+    let (mut state, remote) = state_with_scrollable_agents();
+    state.agent_scroll = state.hits.agent_max_scroll;
+    state.compose(100, 28).unwrap();
+    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+    let (rect, _, pane_id) = state
+        .hits
+        .endpoint_agents
+        .iter()
+        .find(|(_, endpoint_id, _)| *endpoint_id == remote)
+        .cloned()
+        .expect("a remote agent row");
+
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x + 2,
+        row: rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let items = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(),
+        _ => panic!("agent context menu"),
+    };
+    assert_eq!(
+        items.iter().map(|item| item.label).collect::<Vec<_>>(),
+        ["Pin"]
+    );
+    let mut outcome = ClientShellInput::default();
+    state.activate_context_menu_item(0, &mut outcome);
+    assert!(outcome.actions.is_empty(), "pinning sends no request");
+    assert_eq!(state.config.pinned_agents_for(&remote), [pane_id.clone()]);
+    assert!(state.config.pinned_agents.is_empty());
+
+    state.open_endpoint_agent_context_menu(remote.clone(), pane_id, 0, 0);
+    let items = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(),
+        _ => panic!("agent context menu"),
+    };
+    assert_eq!(items[0].label, "Unpin");
+}
+
+#[test]
+fn right_clicking_an_active_machines_agent_keeps_the_full_menu() {
+    let (mut state, _) = state_with_scrollable_agents();
+    state.agent_scroll = 0;
+    state.compose(100, 28).unwrap();
+    let (rect, _, _) = state
+        .hits
+        .endpoint_agents
+        .iter()
+        .find(|(_, endpoint_id, _)| endpoint_id.is_local())
+        .cloned()
+        .expect("a local agent row");
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x + 2,
+        row: rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let items = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(),
+        _ => panic!("agent context menu"),
+    };
+    let labels = items.iter().map(|item| item.label).collect::<Vec<_>>();
+    assert!(labels.contains(&"Pin") && labels.contains(&"Rename") && labels.contains(&"Close"));
+}
+
+#[test]
+fn all_machines_sidebar_has_the_chat_search_box() {
+    let (mut state, _) = state_with_scrollable_agents();
+    state.compose(100, 28).unwrap();
+    assert!(!state.hits.chat_search.is_empty());
+    assert!(state.hits.chat_search.y < state.hits.agent_body.y);
+}
+
+#[test]
+fn remote_pins_survive_a_preferences_round_trip() {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-remote-pins-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (mut state, remote) = state_with_scrollable_agents();
+    state.config.preferences_path = Some(path.clone());
+    state
+        .config
+        .remote_pinned_agents
+        .insert(remote.clone(), vec!["pane_4".into()]);
+    state.persist_chrome_preferences(&mut ClientShellInput::default());
+
+    let saved = super::super::preferences::load(&path).expect("saved preferences");
+    let ClientEndpointId::Ssh(profile_id) = &remote else {
+        panic!("remote endpoint");
+    };
+    assert_eq!(saved.remote_pinned_agents.len(), 1);
+    assert_eq!(
+        saved.remote_pinned_agents[0].profile_id,
+        profile_id.to_string()
+    );
+    assert_eq!(saved.remote_pinned_agents[0].pinned_agents, ["pane_4"]);
+    let _ = std::fs::remove_file(path);
 }

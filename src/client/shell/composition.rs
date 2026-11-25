@@ -48,7 +48,7 @@ impl ClientShellState {
             });
         // A resize invalidates pane geometry, not the healthy Local workspace chrome.
         let local_snapshot = self.snapshot.as_deref().filter(|_| {
-            self.endpoints.len() == 1
+            super::endpoints::visible_endpoints(&self.endpoints, self.local_only).len() == 1
                 && !self.sidebar_collapsed
                 && layout.sidebar.width > 0
                 && self.endpoint_status(&self.active_endpoint_id)
@@ -56,7 +56,7 @@ impl ClientShellState {
         });
         let mut render_state = render::ShellRenderState {
             machine_diagnostics: &self.machine_diagnostics,
-            endpoints: &self.endpoints,
+            endpoints: super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
             active_endpoint_id: &self.active_endpoint_id,
             collapsed_endpoints: &self.collapsed_endpoints,
             collapsed_groups: &self.collapsed_groups,
@@ -187,7 +187,21 @@ impl ClientShellState {
             return None;
         }
         let layout = self.layout(cols, rows);
-        self.chat_search.refresh(snapshot);
+        // The search lists the chats of every listed machine, whichever machine is active.
+        let machines = super::endpoints::visible_endpoints(&self.endpoints, self.local_only)
+            .iter()
+            .filter_map(|endpoint| {
+                if endpoint.endpoint_id == self.active_endpoint_id {
+                    Some((&endpoint.endpoint_id, snapshot))
+                } else {
+                    endpoint
+                        .snapshot
+                        .as_deref()
+                        .map(|snapshot| (&endpoint.endpoint_id, snapshot))
+                }
+            })
+            .collect::<Vec<_>>();
+        self.chat_search.refresh(&machines);
         if self.last_tab_bar_width != Some(layout.tab_bar.width) {
             self.last_tab_bar_width = Some(layout.tab_bar.width);
             self.reveal_focused_tab = true;
@@ -214,7 +228,7 @@ impl ClientShellState {
             &self.config,
             render::ShellRenderState {
                 machine_diagnostics: &self.machine_diagnostics,
-                endpoints: &self.endpoints,
+                endpoints: super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
                 active_endpoint_id: &self.active_endpoint_id,
                 collapsed_endpoints: &self.collapsed_endpoints,
                 collapsed_groups: &self.collapsed_groups,
@@ -611,7 +625,7 @@ impl ClientShellState {
                 &mut composed,
                 Rect::new(0, 0, cols, rows),
                 snapshot,
-                &self.endpoints,
+                super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
                 &self.active_endpoint_id,
                 &self.config,
                 self.navigate_workspace_id
@@ -676,7 +690,7 @@ impl ClientShellState {
                     &mut composed,
                     overlay,
                     snapshot,
-                    &self.endpoints,
+                    super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
                     &self.active_endpoint_id,
                     &self.config.keybinds,
                     &self.config.palette,

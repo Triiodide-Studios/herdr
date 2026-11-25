@@ -38,6 +38,7 @@ pub(super) fn chat_texts(
     agents
         .iter()
         .map(|agent| ChatText {
+            endpoint_id: crate::client::endpoint::ClientEndpointId::Local,
             pane_id: agent.pane_id.clone(),
             names: agent.names.clone(),
             title: agent.title.clone(),
@@ -87,10 +88,22 @@ impl IndexerState {
 
     /// Reads the new conversation of `agents` and returns the next snapshot, or `None` when
     /// nothing changed since `previous`.
+    #[cfg(test)]
     pub(super) fn refresh(
         &mut self,
         previous: &IndexSnapshot,
         agents: &[AgentFacts],
+    ) -> Option<IndexSnapshot> {
+        self.refresh_with(previous, agents, Vec::new())
+    }
+
+    /// [`Self::refresh`], also indexing `pushed`: chats of other machines, known by their names
+    /// and titles from the machines' snapshots.
+    pub(super) fn refresh_with(
+        &mut self,
+        previous: &IndexSnapshot,
+        agents: &[AgentFacts],
+        pushed: Vec<ChatText>,
     ) -> Option<IndexSnapshot> {
         let embedder = self.embedder();
         let status = match &self.model {
@@ -108,7 +121,8 @@ impl IndexerState {
                 .iter()
                 .any(|agent| agent.session.as_deref() == Some(session.as_str()))
         });
-        let texts = chat_texts(agents, &self.summaries);
+        let mut texts = chat_texts(agents, &self.summaries);
+        texts.extend(pushed);
         let unchanged = previous.generation() > 0
             && previous.status() == &status
             && previous.has_embedder() == embedder.is_some()
@@ -191,19 +205,30 @@ pub(super) fn list_agents() -> Result<Vec<AgentFacts>, String> {
 }
 
 impl ChatSearchIndex {
-    /// An index kept current by a background thread for as long as the process lives.
-    pub(crate) fn start() -> Self {
-        let index = Self::inert();
+    /// An index kept current by a background thread for as long as the process lives. With
+    /// `indexes_local`, the thread lists this machine's chats and reads their transcripts; either
+    /// way it indexes the chats the window pushes from the other machines' snapshots.
+    pub(crate) fn start(indexes_local: bool) -> Self {
+        let index = Self::with_snapshot_indexing_local(
+            IndexSnapshot::empty(IndexStatus::Starting),
+            indexes_local,
+        );
         let worker = index.clone();
         let spawned = std::thread::Builder::new()
             .name("chat-search-indexer".into())
             .spawn(move || {
                 let mut state = IndexerState::new();
                 loop {
-                    match list_agents() {
+                    let agents = if indexes_local {
+                        list_agents()
+                    } else {
+                        Ok(Vec::new())
+                    };
+                    match agents {
                         Ok(agents) => {
                             let previous = worker.snapshot();
-                            if let Some(next) = state.refresh(&previous, &agents) {
+                            let pushed = worker.pushed_chats();
+                            if let Some(next) = state.refresh_with(&previous, &agents, pushed) {
                                 worker.publish(next);
                             }
                         }
@@ -345,6 +370,44 @@ mod tests {
             IndexStatus::ModelUnavailable(_)
         ));
         assert_eq!(snapshot.search("solver").len(), 1);
+    }
+
+    #[test]
+    fn pushed_chats_of_other_machines_are_searched_with_this_machines() {
+        let claude = TempClaudeDir::new("pushed");
+        let mut state = IndexerState::for_test(claude.0.clone(), Some(Arc::new(OneHotWords)));
+        let remote = crate::client::endpoint::ClientEndpointId::Ssh(
+            crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        );
+        let pushed = ChatText {
+            endpoint_id: remote.clone(),
+            pane_id: "w1:p1".into(),
+            names: vec!["forge".into()],
+            title: "warm the shader cache".into(),
+            keywords: Vec::new(),
+        };
+        let previous = IndexSnapshot::empty(IndexStatus::Starting);
+        let snapshot = state
+            .refresh_with(
+                &previous,
+                &[facts("w1:p1", None, "audio solver")],
+                vec![pushed.clone()],
+            )
+            .expect("publishes both machines");
+        let shader = snapshot.search("shader");
+        assert_eq!(shader.len(), 1);
+        assert_eq!(shader[0].endpoint_id, remote, "same pane id, other machine");
+        assert!(snapshot.search("solver")[0].endpoint_id.is_local());
+        assert!(
+            state
+                .refresh_with(
+                    &snapshot,
+                    &[facts("w1:p1", None, "audio solver")],
+                    vec![pushed]
+                )
+                .is_none(),
+            "unchanged pushed chats publish nothing"
+        );
     }
 
     #[test]

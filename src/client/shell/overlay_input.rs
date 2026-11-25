@@ -198,8 +198,11 @@ impl ClientShellState {
             scroll: 0,
             filter: None,
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, &navigator);
+        let rows = render::client_navigator_rows(
+            super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
+            &self.active_endpoint_id,
+            &navigator,
+        );
         navigator.selected = rows
             .iter()
             .find(|row| row.current)
@@ -211,8 +214,11 @@ impl ClientShellState {
         let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
             return;
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
+        let rows = render::client_navigator_rows(
+            super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
+            &self.active_endpoint_id,
+            navigator,
+        );
         if rows.is_empty() {
             navigator.selected = None;
             return;
@@ -228,8 +234,11 @@ impl ClientShellState {
         let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
             return;
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
+        let rows = render::client_navigator_rows(
+            super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
+            &self.active_endpoint_id,
+            navigator,
+        );
         let viewport_rows = viewport_rows.max(1);
         navigator.scroll = scroll.min(rows.len().saturating_sub(viewport_rows));
         let selected =
@@ -243,8 +252,11 @@ impl ClientShellState {
         let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
             return;
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
+        let rows = render::client_navigator_rows(
+            super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
+            &self.active_endpoint_id,
+            navigator,
+        );
         let Some(selected) =
             super::aggregate_navigation::navigator_selected_index(&rows, navigator)
         else {
@@ -277,7 +289,7 @@ impl ClientShellState {
         let target = self.overlay.as_ref().and_then(|overlay| match overlay {
             ClientShellOverlay::Navigator(navigator) => {
                 let rows = render::client_navigator_rows(
-                    &self.endpoints,
+                    super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
                     &self.active_endpoint_id,
                     navigator,
                 );
@@ -708,7 +720,7 @@ impl ClientShellState {
             if matches!(code, KeyCode::End | KeyCode::Char('G')) && modifiers.is_empty() {
                 let last = self.overlay.as_ref().and_then(|overlay| match overlay {
                     ClientShellOverlay::Navigator(navigator) => render::client_navigator_rows(
-                        &self.endpoints,
+                        super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
                         &self.active_endpoint_id,
                         navigator,
                     )

@@ -22,10 +22,11 @@ pub(super) struct AgentRow {
 
 /// A search's answer for the agents panel: the chats to list, in this order, instead of every agent.
 pub(super) struct AgentFilter<'a> {
-    pub(super) pane_ids: &'a [String],
+    /// The matching chats, best first: the machine each runs on and its pane.
+    pub(super) targets: &'a [super::chat_search_box::ChatTarget],
     /// Shown in place of the sort label.
     pub(super) label: String,
-    pub(super) highlighted: Option<&'a str>,
+    pub(super) highlighted: Option<&'a super::chat_search_box::ChatTarget>,
     /// Scroll the list to the highlighted row.
     pub(super) reveal_highlighted: bool,
     pub(super) empty_message: &'static str,
@@ -86,6 +87,7 @@ pub(super) fn render_agent_panel(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
+    active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
     filter: Option<&AgentFilter<'_>>,
@@ -99,16 +101,18 @@ pub(super) fn render_agent_panel(
     }
 
     let mut rows = match filter {
+        // The single-machine panel shows the active machine's results.
         Some(filter) => filter
-            .pane_ids
+            .targets
             .iter()
-            .filter_map(|pane_id| agent_row(snapshot, pane_id, config, None))
+            .filter(|(endpoint_id, _)| endpoint_id == active_endpoint_id)
+            .filter_map(|(_, pane_id)| agent_row(snapshot, pane_id, config, None))
             .collect(),
         None => agent_rows(snapshot, config, None),
     };
     if let Some(highlighted) = filter.and_then(|filter| filter.highlighted) {
         for row in &mut rows {
-            row.selected = row.pane_id == highlighted;
+            row.selected = &highlighted.0 == active_endpoint_id && row.pane_id == highlighted.1;
         }
     }
     let reveal = filter

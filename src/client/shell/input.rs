@@ -884,9 +884,9 @@ impl ClientShellState {
                 .is_some(),
             KeybindMatch::Action(KeybindAction::FocusAgent(index)) => {
                 super::aggregate_navigation::online_agent_targets(
-                    &self.endpoints,
+                    super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
                     &self.active_endpoint_id,
-                    self.config.agent_panel_sort,
+                    &self.config,
                 )
                 .get(*index)
                 .is_some()

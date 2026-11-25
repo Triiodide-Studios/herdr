@@ -42,6 +42,8 @@ pub(super) fn render_collapsed(
     }
 }
 
+/// The all-machines agents panel. While the chat search holds a query (`filter`), it lists only
+/// the matching chats, on every listed machine.
 pub(super) fn render_expanded(
     buffer: &mut Buffer,
     area: Rect,
@@ -50,27 +52,35 @@ pub(super) fn render_expanded(
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
+    filter: Option<&super::agent_sidebar::AgentFilter<'_>>,
     hits: &mut ShellHitMap,
 ) {
-    if !super::agent_sidebar::render_agent_panel_header(
-        buffer,
-        area,
-        agent_view_label,
-        config,
-        hits,
-    ) {
+    let label = filter
+        .map(|filter| filter.label.as_str())
+        .or(agent_view_label);
+    if !super::agent_sidebar::render_agent_panel_header(buffer, area, label, config, hits) {
         return;
     }
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    let rows = match filter {
+        Some(filter) => search_rows(endpoints, filter, config),
+        None => agent_rows(endpoints, active_endpoint_id, config),
+    };
+    let reveal = filter
+        .filter(|filter| filter.reveal_highlighted)
+        .and_then(|_| rows.iter().position(|row| row.agent.selected));
+    let empty_message = match filter {
+        Some(filter) => Some(filter.empty_message),
+        None => agent_view_label.map(|_| " no matching agents"),
+    };
     super::agent_sidebar::render_agent_list(
         buffer,
         area,
         &rows,
-        agent_view_label.map(|_| " no matching agents"),
+        empty_message,
         config,
         agent_scroll,
         hits,
-        None,
+        reveal,
         |row| row.agent.rows.len(),
         |buffer, rect, row, hits| {
             super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
@@ -98,7 +108,11 @@ impl ClientShellState {
         if body_height == 0 {
             return;
         }
-        let rows = agent_rows(&self.endpoints, &self.active_endpoint_id, &self.config);
+        let rows = agent_rows(
+            super::endpoints::visible_endpoints(&self.endpoints, self.local_only),
+            &self.active_endpoint_id,
+            &self.config,
+        );
         let Some(target) = rows
             .iter()
             .position(|row| &row.endpoint_id == endpoint_id && row.agent.pane_id == pane_id)
@@ -157,22 +171,52 @@ fn agent_rows(
         .flatten()
         .collect::<HashMap<_, _>>();
 
-    super::aggregate_navigation::aggregate_agent_rows(
-        endpoints,
-        active_endpoint_id,
-        config.agent_panel_sort,
-    )
-    .into_iter()
-    .filter_map(|row| {
-        let key = (row.endpoint.endpoint_id.clone(), row.agent.pane_id.clone());
-        let mut agent = rendered_rows.remove(&key)?;
-        agent.focused &= row.endpoint.endpoint_id == active_endpoint_id;
-        Some(EndpointAgentRow {
-            endpoint_id: row.endpoint.endpoint_id.clone(),
-            machine_label: row.endpoint.label.to_owned(),
-            stale: row.endpoint.stale(),
-            agent,
+    super::aggregate_navigation::aggregate_agent_rows(endpoints, active_endpoint_id, config)
+        .into_iter()
+        .filter_map(|row| {
+            let key = (row.endpoint.endpoint_id.clone(), row.agent.pane_id.clone());
+            let mut agent = rendered_rows.remove(&key)?;
+            agent.focused &= row.endpoint.endpoint_id == active_endpoint_id;
+            agent.pinned = config
+                .pinned_agents_for(row.endpoint.endpoint_id)
+                .contains(&agent.pane_id);
+            Some(EndpointAgentRow {
+                endpoint_id: row.endpoint.endpoint_id.clone(),
+                machine_label: row.endpoint.label.to_owned(),
+                stale: row.endpoint.stale(),
+                agent,
+            })
         })
-    })
-    .collect()
+        .collect()
+}
+
+/// The chat search's results, in rank order, on whichever listed machine each runs.
+fn search_rows(
+    endpoints: &[ClientShellEndpoint],
+    filter: &super::agent_sidebar::AgentFilter<'_>,
+    config: &ClientShellConfig,
+) -> Vec<EndpointAgentRow> {
+    filter
+        .targets
+        .iter()
+        .filter_map(|target| {
+            let (endpoint_id, pane_id) = target;
+            let endpoint = endpoints
+                .iter()
+                .find(|endpoint| &endpoint.endpoint_id == endpoint_id)?;
+            let snapshot = endpoint.snapshot.as_deref()?;
+            let mut agent =
+                super::agent_sidebar::agent_row(snapshot, pane_id, config, Some(&endpoint.label))?;
+            agent.pinned = config
+                .pinned_agents_for(&endpoint.endpoint_id)
+                .contains(pane_id);
+            agent.selected = filter.highlighted == Some(target);
+            Some(EndpointAgentRow {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                machine_label: endpoint.label.clone(),
+                stale: endpoint.status != ClientEndpointStatus::Online,
+                agent,
+            })
+        })
+        .collect()
 }

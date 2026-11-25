@@ -25,7 +25,8 @@ const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_IO_POLL: Duration = Duration::from_millis(1);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
-const NONINTERACTIVE_SSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+// Windows hosts under load can spend 10+ s starting PowerShell and autoloading modules.
+const NONINTERACTIVE_SSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const NONINTERACTIVE_SSH_STDERR_LIMIT: usize = 16 * 1024;
 const BRIDGE_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -42,6 +43,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
+    let preferences_key = format!("{}\n{session_name}", remote.target);
     let program = std::env::args()
         .next()
         .unwrap_or_else(|| "herdr".to_string());
@@ -83,7 +85,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         false,
     )?;
 
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    run_client_process(
+        &local_socket,
+        &reattach_command,
+        remote.keybindings,
+        &preferences_key,
+    )
 }
 
 pub(crate) fn check_saved_ssh(target: &str, session: &str) -> io::Result<()> {
@@ -515,8 +522,10 @@ fn posix_remote_output_command(command: &str) -> String {
 }
 
 fn windows_powershell_script_command(script: &str) -> String {
+    // Without a console, Windows PowerShell writes progress ("Preparing modules for first use.")
+    // to stderr as CLIXML, which reaches the user's terminal.
     let script = format!(
-        "[Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); {script}"
+        "$ProgressPreference = 'SilentlyContinue'; [Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); {script}"
     );
     let utf16 = script
         .encode_utf16()
@@ -1015,6 +1024,7 @@ fn output_with_forwarded_stderr(mut child: Child, stdin: Option<&[u8]>) -> io::R
         let mut captured = Vec::new();
         let mut buffer = [0_u8; 8 * 1024];
         let mut destination = io::stderr();
+        let mut filter = RemoteStderrFilter::default();
 
         loop {
             let read = child_stderr.read(&mut buffer)?;
@@ -1022,9 +1032,14 @@ fn output_with_forwarded_stderr(mut child: Child, stdin: Option<&[u8]>) -> io::R
                 break;
             }
             captured.extend_from_slice(&buffer[..read]);
-            if destination.write_all(&buffer[..read]).is_ok() {
+            let shown = filter.push(&buffer[..read]);
+            if !shown.is_empty() && destination.write_all(&shown).is_ok() {
                 let _ = destination.flush();
             }
+        }
+        let shown = filter.finish();
+        if !shown.is_empty() && destination.write_all(&shown).is_ok() {
+            let _ = destination.flush();
         }
 
         Ok(captured)
@@ -1051,6 +1066,55 @@ fn output_with_forwarded_stderr(mut child: Child, stdin: Option<&[u8]>) -> io::R
     write_result?;
     output.stderr = stderr_result?;
     Ok(output)
+}
+
+/// Lines a Windows remote prints on stderr that mean nothing to the user: cmd.exe's answer to the
+/// POSIX platform probe (`/bin/sh -s`), which is expected to fail there before the Windows probe
+/// runs. Everything else is shown as it arrives; the full stderr is still captured for errors.
+const REMOTE_STDERR_NOISE: &[&[u8]] = &[b"The system cannot find the path specified."];
+
+#[derive(Default)]
+struct RemoteStderrFilter {
+    pending: Vec<u8>,
+}
+
+impl RemoteStderrFilter {
+    /// The bytes of `chunk` to show now. A partial line that could still become a noise line is
+    /// held until its end arrives.
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(chunk);
+        let mut shown = Vec::new();
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=end).collect::<Vec<_>>();
+            if !Self::is_noise(&line) {
+                shown.extend_from_slice(&line);
+            }
+        }
+        let could_be_noise = REMOTE_STDERR_NOISE
+            .iter()
+            .any(|noise| noise.starts_with(&self.pending) || self.pending.starts_with(noise));
+        if !self.pending.is_empty() && !could_be_noise {
+            shown.append(&mut self.pending);
+        }
+        shown
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        let rest = std::mem::take(&mut self.pending);
+        if Self::is_noise(&rest) {
+            Vec::new()
+        } else {
+            rest
+        }
+    }
+
+    fn is_noise(line: &[u8]) -> bool {
+        let trimmed = line
+            .strip_suffix(b"\n")
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .unwrap_or(line);
+        REMOTE_STDERR_NOISE.contains(&trimmed)
+    }
 }
 
 fn normalize_remote_output(mut output: Output) -> io::Result<Output> {
@@ -1614,7 +1678,7 @@ fn remote_binary_candidates(
 
 fn windows_remote_binary_candidate_command() -> String {
     windows_powershell_script_command(&format!(
-        r#"function Emit-HerdrPath([string]$CandidatePath) {{ if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {{ return }}; $candidateFullPath = [System.IO.Path]::GetFullPath($CandidatePath); $encodedCandidate = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($candidateFullPath)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_PATH_MARKER}' + $encodedCandidate) }}; $pathCommand = Get-Command herdr.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $pathCommand) {{ Emit-HerdrPath $pathCommand.Source }}; $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Get-CimInstance Win32_Process -Filter "Name = 'herdr.exe' OR Name = 'herdr-dev.exe'" -ErrorAction SilentlyContinue | ForEach-Object {{ $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue; if ($owner.ReturnValue -eq 0 -and $owner.Sid -eq $userSid) {{ Emit-HerdrPath $_.ExecutablePath }} }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Get-Item -LiteralPath (Join-Path $herdrHome 'packages\standalone\current') -Force -ErrorAction SilentlyContinue; if ($null -ne $activeJunction -and -not [string]::IsNullOrWhiteSpace([string]$activeJunction.Target)) {{ Emit-HerdrPath (Join-Path ([string]$activeJunction.Target) 'herdr.exe') }}; exit 0"#
+        r#"function Emit-HerdrPath([string]$CandidatePath) {{ if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {{ return }}; $candidateFullPath = [System.IO.Path]::GetFullPath($CandidatePath); $encodedCandidate = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($candidateFullPath)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_PATH_MARKER}' + $encodedCandidate) }}; $pathCommand = Get-Command herdr.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $pathCommand) {{ Emit-HerdrPath $pathCommand.Source }}; $mySession = (Get-Process -Id $PID).SessionId; Get-Process -Name herdr,herdr-dev -ErrorAction SilentlyContinue | Where-Object {{ $_.SessionId -eq $mySession -and $_.Path }} | ForEach-Object {{ Emit-HerdrPath $_.Path }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Get-Item -LiteralPath (Join-Path $herdrHome 'packages\standalone\current') -Force -ErrorAction SilentlyContinue; if ($null -ne $activeJunction -and -not [string]::IsNullOrWhiteSpace([string]$activeJunction.Target)) {{ Emit-HerdrPath (Join-Path ([string]$activeJunction.Target) 'herdr.exe') }}; exit 0"#
     ))
 }
 
@@ -3325,6 +3389,7 @@ fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
+    preferences_key: &str,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let status = Command::new(exe)
@@ -3335,6 +3400,7 @@ fn run_client_process(
         )
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
+        .env(REMOTE_PREFERENCES_KEY_ENV_VAR, preferences_key)
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -4613,7 +4679,7 @@ mod tests {
         ];
 
         let preamble = format!(
-            "[Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); "
+            "$ProgressPreference = 'SilentlyContinue'; [Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); "
         );
         for (label, command, expected) in commands {
             let script = decode_windows_command(&command);
@@ -4622,6 +4688,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label} lacks shared output marker: {script}"));
             assert_eq!(script, expected, "{label}");
         }
+    }
+
+    #[test]
+    fn stderr_filter_drops_the_cmd_probe_failure_and_keeps_everything_else() {
+        let mut filter = RemoteStderrFilter::default();
+        let mut shown = Vec::new();
+        for chunk in [
+            &b"The system cannot "[..],
+            b"find the path specified.\r\nreal ",
+            b"error\nEnter passphrase: ",
+        ] {
+            shown.extend(filter.push(chunk));
+        }
+        shown.extend(filter.finish());
+        assert_eq!(shown, b"real error\nEnter passphrase: ");
+
+        let mut filter = RemoteStderrFilter::default();
+        let mut shown = filter.push(b"The system cannot find the path specified.");
+        shown.extend(filter.finish());
+        assert!(shown.is_empty());
     }
 
     #[test]
@@ -4706,24 +4792,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_process_candidates_require_a_verified_current_user_owner() {
-        // Supply ownership results without needing another Windows account.
-        // Execute the real discovery script, including its path validation.
+    fn windows_process_candidates_require_the_current_session_and_a_readable_path() {
+        // Triiodide: discovery uses Get-Process, not WMI, because Win32_Process
+        // queries take minutes on a loaded workstation. Supply processes without
+        // needing another logon session. Execute the real discovery script,
+        // including its path validation.
         let fixture = r#"
 function Get-Command {}
 function Get-Item {}
-function Get-CimInstance {
-    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    [pscustomobject]@{ ExecutablePath=$env:HERDR_TEST_EXE; OwnerSid=$sid; OwnerResult=0 }
-    [pscustomobject]@{ ExecutablePath="$env:SystemRoot\System32\cmd.exe"; OwnerSid='S-1-0-0'; OwnerResult=0 }
-    [pscustomobject]@{ ExecutablePath="$PSHOME\powershell.exe"; OwnerSid=$sid; OwnerResult=2 }
-}
-function Invoke-CimMethod {
-    param($InputObject)
-    [pscustomobject]@{ ReturnValue=$InputObject.OwnerResult; Sid=$InputObject.OwnerSid }
-}
 function Get-Process {
-    Get-CimInstance | ForEach-Object { [pscustomobject]@{ Path=$_.ExecutablePath } }
+    [CmdletBinding()] param($Id, $Name)
+    if ($Id) { return [pscustomobject]@{ SessionId=7 } }
+    [pscustomobject]@{ Path=$env:HERDR_TEST_EXE; SessionId=7 }
+    [pscustomobject]@{ Path="$env:SystemRoot\System32\cmd.exe"; SessionId=8 }
+    [pscustomobject]@{ Path=$null; SessionId=7 }
 }
 "#;
         let executable = std::env::current_exe().unwrap();

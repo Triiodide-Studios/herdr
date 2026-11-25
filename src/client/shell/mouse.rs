@@ -1824,6 +1824,22 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                let endpoint_agent = self
+                    .hits
+                    .endpoint_agents
+                    .iter()
+                    .find(|(rect, _, _)| super::contains(*rect, point))
+                    .map(|(_, endpoint_id, pane_id)| (endpoint_id.clone(), pane_id.clone()));
+                if let Some((endpoint_id, pane_id)) = endpoint_agent {
+                    self.open_endpoint_agent_context_menu(
+                        endpoint_id,
+                        pane_id,
+                        mouse.column,
+                        mouse.row,
+                    );
+                    outcome.repaint = true;
+                    return;
+                }
                 if super::contains(self.hits.agent_body, point) {
                     self.open_agent_panel_context_menu(mouse.column, mouse.row);
                     outcome.repaint = true;

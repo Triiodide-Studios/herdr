@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::embed::Embedder;
 use super::keywords::is_stopword;
+use crate::client::endpoint::ClientEndpointId;
 
 /// Most chats a search returns.
 const MAX_RESULTS: usize = 24;
@@ -26,6 +27,9 @@ const KEYWORD_WEIGHT: f32 = 0.9;
 /// What the search knows about one chat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChatText {
+    /// The machine the chat runs on. This machine's chats also carry keywords from their
+    /// transcripts; a saved machine's are known by their names and title alone.
+    pub(crate) endpoint_id: ClientEndpointId,
     pub(crate) pane_id: String,
     /// Names the chat goes by: the integration's name and the plugin's.
     pub(crate) names: Vec<String>,
@@ -123,6 +127,7 @@ impl IndexedChat {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChatHit {
+    pub(crate) endpoint_id: ClientEndpointId,
     pub(crate) pane_id: String,
     pub(crate) score: f32,
 }
@@ -245,6 +250,7 @@ impl IndexSnapshot {
             .filter_map(|chat| {
                 let score = chat.score(&query);
                 (score >= MIN_SCORE).then(|| ChatHit {
+                    endpoint_id: chat.text.endpoint_id.clone(),
                     pane_id: chat.text.pane_id.clone(),
                     score,
                 })
@@ -253,6 +259,7 @@ impl IndexSnapshot {
         hits.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
+                .then_with(|| a.endpoint_id.cmp(&b.endpoint_id))
                 .then_with(|| a.pane_id.cmp(&b.pane_id))
         });
         if let Some(best) = hits.first().map(|hit| hit.score) {
@@ -293,6 +300,12 @@ pub(crate) struct ChatSearchIndex {
 }
 
 struct Shared {
+    /// Whether the background thread reads this machine's chats and transcripts itself. A
+    /// `--remote` client's "local" machine is the remote one, so its thread does not.
+    indexes_local: bool,
+    /// Chats the window hands over from the machines' snapshots: every chat the thread does not
+    /// list itself.
+    pushed: Mutex<Vec<ChatText>>,
     snapshot: Mutex<Arc<IndexSnapshot>>,
     refresh_requested: Mutex<bool>,
     wake: Condvar,
@@ -305,8 +318,17 @@ impl ChatSearchIndex {
     }
 
     pub(crate) fn with_snapshot(snapshot: IndexSnapshot) -> Self {
+        Self::with_snapshot_indexing_local(snapshot, false)
+    }
+
+    pub(crate) fn with_snapshot_indexing_local(
+        snapshot: IndexSnapshot,
+        indexes_local: bool,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
+                indexes_local,
+                pushed: Mutex::new(Vec::new()),
                 snapshot: Mutex::new(Arc::new(snapshot)),
                 refresh_requested: Mutex::new(false),
                 wake: Condvar::new(),
@@ -328,6 +350,33 @@ impl ChatSearchIndex {
             .snapshot
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Arc::new(snapshot);
+    }
+
+    /// Whether the background thread indexes this machine's chats, so the window need not push them.
+    pub(crate) fn indexes_local(&self) -> bool {
+        self.shared.indexes_local
+    }
+
+    /// Hands the thread the chats it does not list itself; asks for a refresh when they changed.
+    pub(crate) fn push_chats(&self, chats: Vec<ChatText>) {
+        let mut pushed = self
+            .shared
+            .pushed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *pushed != chats {
+            *pushed = chats;
+            drop(pushed);
+            self.request_refresh();
+        }
+    }
+
+    pub(crate) fn pushed_chats(&self) -> Vec<ChatText> {
+        self.shared
+            .pushed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Asks the background thread to refresh now instead of at its next interval.
@@ -404,6 +453,7 @@ pub(in crate::client) mod test_support {
         keywords: &[&str],
     ) -> ChatText {
         ChatText {
+            endpoint_id: ClientEndpointId::Local,
             pane_id: pane_id.to_owned(),
             names: names.iter().map(|name| (*name).to_owned()).collect(),
             title: title.to_owned(),

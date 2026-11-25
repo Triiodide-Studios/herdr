@@ -10,6 +10,9 @@ impl ClientShellState {
             crate::input::KeybindMatch::Action(crate::input::KeybindAction::Detach) => {
                 outcome.detach = true;
             }
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleLocalOnly) => {
+                self.toggle_local_only(outcome);
+            }
             crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebar) => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
                 self.sidebar_collapsed_manual = true;

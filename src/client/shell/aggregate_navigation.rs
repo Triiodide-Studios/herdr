@@ -53,7 +53,36 @@ pub(super) struct AggregateAgentTarget {
     pub(super) pane_id: String,
 }
 
+/// Every machine's agents in the all-machines panel's order: pinned agents first (this machine's,
+/// then each saved machine's, each in pin order), then the rest in the active view's or the
+/// built-in sort's order.
 pub(super) fn aggregate_agent_rows<'a>(
+    endpoints: &'a [ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    config: &ClientShellConfig,
+) -> Vec<AggregateAgentRow<'a>> {
+    let mut rows =
+        unpinned_aggregate_agent_rows(endpoints, active_endpoint_id, config.agent_panel_sort);
+    // A stable sort: unpinned rows keep the order they were given.
+    rows.sort_by_key(|row| {
+        let endpoint = row.endpoint;
+        config
+            .pinned_agents_for(endpoint.endpoint_id)
+            .iter()
+            .position(|pinned| *pinned == row.agent.pane_id)
+            .map_or((true, false, 0, 0), |rank| {
+                (
+                    false,
+                    !endpoint.endpoint_id.is_local(),
+                    endpoint.endpoint_index,
+                    rank,
+                )
+            })
+    });
+    rows
+}
+
+fn unpinned_aggregate_agent_rows<'a>(
     endpoints: &'a [ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     sort: crate::config::AgentPanelSortConfig,
@@ -263,9 +292,9 @@ impl crate::agent_view_eval::AgentViewEntry for ClientAgentViewEntry<'_> {
 pub(super) fn online_agent_targets(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
-    sort: crate::config::AgentPanelSortConfig,
+    config: &ClientShellConfig,
 ) -> Vec<AggregateAgentTarget> {
-    aggregate_agent_rows(endpoints, active_endpoint_id, sort)
+    aggregate_agent_rows(endpoints, active_endpoint_id, config)
         .into_iter()
         .filter(|row| !row.endpoint.stale())
         .map(|row| AggregateAgentTarget {
