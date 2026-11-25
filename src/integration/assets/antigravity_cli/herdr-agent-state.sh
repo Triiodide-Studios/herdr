@@ -3,10 +3,13 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=antigravity_cli
-# HERDR_INTEGRATION_VERSION=3
+# HERDR_INTEGRATION_VERSION=4
 
 # Session-only: this hook reports the Antigravity conversation so Herdr can
 # resume the pane. Lifecycle state comes from Herdr's screen detection.
+# Subagents (a /swarm's workers, research and image agents) run in the same
+# process and fire PreInvocation with their own conversationId; they are not
+# the pane's conversation, so they are skipped.
 
 set -eu
 
@@ -45,6 +48,17 @@ def text(name):
 session_id = text("conversationId")
 if session_id is None:
     raise SystemExit(0)
+
+# A subagent is listed in the conversation that spawned it:
+# brain/<parent>/.system_generated/subagents/<id>.json. The payload names the
+# brain directory of this conversation, whose parent holds every conversation.
+artifact_dir = text("artifactDirectoryPath")
+if artifact_dir is not None:
+    import glob
+    brain = os.path.dirname(os.path.normpath(artifact_dir))
+    pattern = os.path.join(glob.escape(brain), "*", ".system_generated", "subagents", glob.escape(session_id) + ".json")
+    if glob.glob(pattern):
+        raise SystemExit(0)
 
 seq = time.time_ns()
 params = {
